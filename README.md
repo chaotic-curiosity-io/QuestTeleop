@@ -1,111 +1,104 @@
-# Unity-PassthroughCameraAPISamples
+# QuestTeleop
 
-## Project Overview
+**Meta Quest 3 / 3S as an XR teleoperation client for robot / VLA pipelines.**
 
-The **Unity-PassthroughCameraAPISamples** project helps Unity developers access Quest camera data using the **PassthroughCameraAccess** component from the Mixed Reality Utility Kit (MRUK). This component provides direct access to headset cameras with enhanced functionality including:
-- **Precise timestamps** for better camera-world alignment
-- **Simultaneous access to both cameras** (left and right)
-- **Complete camera metadata** including intrinsics, extrinsics, and pose information
+QuestTeleop turns a Quest headset into an embodied controller: your head pose,
+hand poses, and pointing drive a real or simulated robot. It carries two
+independent bridges, both built on Meta's Passthrough Camera API — you stream
+head + native hand tracking over the network, a host-side server retargets it to
+a robot, and you see the result in passthrough.
 
-The project includes **five sample scenes** demonstrating various use cases:
+| Bridge | Drives | Talks to |
+|---|---|---|
+| **`Assets/VlaTeleop/`** | robot **joints** — finger curls, arm IK, head — for humanoids (Unitree H1 / G1, Fourier GR-1, …) | [openvla-unity-sim2real](https://github.com/chaotic-curiosity-io/robotics-unity) `handtracking/teleop_server.py` → DevVLA |
+| **`Assets/ReachyBridge/`** | a **Reachy Mini** in follow-user / follow-hand / raycast / gaze modes | the ReachyBrain XR bridge (Mac server + on-robot app) |
 
-| CameraToWorld | BrightnessEstimation | MultiObjectDectection | ShaderSample |
-|:-------------:|:--------------------:|:---------------------:|:------------:|
-| ![GIF 1](./Media/CameraToWorld.gif) | ![GIF 2](./Media/BrightnessEstimation.gif) | ![GIF 3](./Media/ObjectDetectionSentis.gif) | ![GIF 4](./Media/ShaderSample.gif) |
+Each subfolder has its own README with the full setup; this one is the map.
 
-## Documentation
+## Why Quest for teleop
 
-For comprehensive guides, API reference, and tutorials, visit the official Meta Developers documentation:
+Quest gives everything the sensor side of teleop wants, natively and metric:
 
-- **[Passthrough Camera API Overview](https://developers.meta.com/horizon/documentation/unity/unity-pca-overview)** - Introduction and key concepts
-- **[Getting Started Guide](https://developers.meta.com/horizon/documentation/unity/unity-pca-documentation)** - Setup, configuration, and usage instructions
-- **[Unity Inference Engine Integration](https://developers.meta.com/horizon/documentation/unity/unity-pca-sentis)** - Using ML/CV models with PCA
-- **[Migration Guide](https://developers.meta.com/horizon/documentation/unity/unity-pca-migration-from-webcamtexture)** - Migrating from WebCamTexture
+| | typical monocular rig | Quest |
+|---|---|---|
+| Head pose | external VIO / SLAM lib | OVR inside-out (`centerEyeAnchor`) |
+| Hands | MediaPipe @ assumed depth | native `OVRSkeleton` — **true metric 3D** |
+| Camera pose | monocular relocalization | `PassthroughCameraAccess.GetCameraPose()` per frame |
+| Camera intrinsics | one-time calibration | rectilinear `Intrinsics` from the API |
+| Handedness | egocentric mirror ambiguity | correct (`HandLeft` / `HandRight`) |
 
 ## Requirements
 
-- **Unity:** 6000.0.38f1 or newer
-- **Packages:**
-  - [Meta MRUK](https://assetstore.unity.com/packages/tools/integration/meta-mr-utility-kit-272450) (v81 or higher)
-  - [Unity Inference Engine](https://unity.com/sentis) (v2.2.1 for MultiObjectDetection sample)
-- **Hardware:** Quest 3 / Quest 3S with Horizon OS v74 or higher
-- **Permissions:** `horizonos.permission.HEADSET_CAMERA`
-- **Passthrough:** Must be enabled in your project
+- **Quest 3 / 3S** (older Quest hardware doesn't expose passthrough camera frames).
+- **Unity 6000.3.19f1** (this project's version; `ProjectSettings/ProjectVersion.txt`).
+- **MRUK v85** (`com.meta.xr.mrutilitykit` 85.0.0) for `PassthroughCameraAccess`;
+  Meta Core SDK for `OVRCameraRig` / `OVRHand` / `OVRSkeleton` / `OVRInput`.
+- **Horizon OS v74+**, hand tracking enabled, and the
+  `horizonos.permission.HEADSET_CAMERA` permission + passthrough
+  (both already set in this project — see `Assets/Plugins/Android/AndroidManifest.xml`).
+- The **XR Simulator does not support the Passthrough Camera API** — test on a
+  physical device or via Meta Horizon Link.
 
-> [!NOTE]
-> You must use a physical headset or Meta Horizon Link v2.1 or later to preview the passthrough camera. XR Simulator does not currently support Passthrough Camera API.
+## Quick start — VLA joint teleop (`Assets/VlaTeleop/`)
 
-## Download the Project
+1. Open a scene with an `OVRCameraRig` + hand tracking (any
+   PassthroughCameraApiSamples scene, or one from **ReachyBridge ▸ Set Up Active
+   Scene**).
+2. **Tools ▸ Robot Teleop ▸ Add VLA Teleop Sender** — adds a `RobotTeleop`
+   object (sender + debug gizmos), auto-binding the rig and both hands at Play.
+3. **Set the sender's endpoints to your host machine's LAN IP** — on a standalone
+   build, `127.0.0.1` is the *headset*. e.g. `192.168.1.152:9905` (teleop server)
+   and `192.168.1.152:9906` (DevVLA head camera). Headset + host on the same Wi-Fi.
+4. Build + run on the Quest (**ReachyBridge ▸ Build and Run on Quest** builds any
+   scene in this project).
+5. On the host, in [openvla-unity-sim2real](https://github.com/chaotic-curiosity-io/robotics-unity):
+   ```bash
+   handtracking/run_xr_teleop.sh --robot h1 --xr-host 0.0.0.0
+   ```
+   then in DevVLA run `VLA/Setup Hand Humanoid Scene/Unitree H1` +
+   `VLA/Teleop Mode/Arms + Hands + Head` and press Play.
 
-First, ensure you have Git LFS installed by running this command:
+Full detail, the wire protocol, and calibration notes: **[`Assets/VlaTeleop/README.md`](Assets/VlaTeleop/README.md)**.
 
-```bash
-git lfs install
+## Quick start — ReachyBrain XR bridge (`Assets/ReachyBridge/`)
+
+Use the top-level **ReachyBridge** menu (Settings → Set Up Active Scene → Build
+and Run on Quest). Follow / hand / raycast / gaze modes on the Touch controllers
+or hand tracking. Full detail: **[`Assets/ReachyBridge/README.md`](Assets/ReachyBridge/README.md)**.
+
+## Repository layout
+
+```
+Assets/
+  VlaTeleop/                 VLA joint teleop — xr_pose UDP :9905/:9906
+    QuestHandLandmarks.cs      OVRSkeleton -> MediaPipe 21-landmark order (metric)
+    VlaTeleopSender.cs         head + hands -> xr_pose UDP
+    VlaTeleopGizmos.cs         torso + arm-target debug overlay
+    Editor/VlaTeleopSceneSetup.cs   Tools ▸ Robot Teleop menu
+  ReachyBridge/              ReachyBrain follow/hand/raycast/gaze bridge (NDJSON :9878)
+  PassthroughCameraApiSamples/   the upstream Meta sample scenes (unmodified)
+  ...
 ```
 
-Then, clone this repo using the "Code" button above, or this command:
+Meta's original sample scenes (`CameraViewer`, `CameraToWorld`,
+`BrightnessEstimation`, `MultiObjectDetection`, `ShaderSample`) are kept intact —
+they're the reference for the passthrough-camera plumbing the teleop bridges
+build on.
 
-```bash
-git clone https://github.com/oculus-samples/Unity-PassthroughCameraApiSamples
-```
+## Related projects
 
-## Project Content
+- **[openvla-unity-sim2real](https://github.com/chaotic-curiosity-io/robotics-unity)** —
+  the host-side teleop server + DevVLA robot scenes the VlaTeleop bridge drives.
+- **VitureUnity** — the Viture Luma Ultra sibling app; QuestTeleop's VlaTeleop is
+  a port of its `VlaTeleopSender` ("Pipeline 3 — XR teleop") with native Quest
+  hands in place of MediaPipe.
 
-The project contains **five sample scenes** that demonstrate how to use the **PassthroughCameraAccess** component to access Quest camera data. All sample code and resources are located in the [**`PassthroughCameraApiSamples`**](./Assets/PassthroughCameraApiSamples/) folder:
+## Attribution & license
 
-### Samples
-
-* **[`CameraViewer`](./Assets/PassthroughCameraApiSamples/CameraViewer)** - Displays a 2D canvas with camera feed
-* **[`CameraToWorld`](./Assets/PassthroughCameraApiSamples/CameraToWorld)** - Aligns RGB camera pose with Passthrough and transforms 2D coordinates to 3D world space rays
-* **[`BrightnessEstimation`](./Assets/PassthroughCameraApiSamples/BrightnessEstimation)** - Adapts the experience based on environment brightness
-* **[`MultiObjectDetection`](./Assets/PassthroughCameraApiSamples/MultiObjectDetection)** - Uses Unity Inference Engine for real-world object recognition
-* **[`ShaderSample`](./Assets/PassthroughCameraApiSamples/ShaderSample)** - Applies custom GPU effects to camera texture
-
-### Additional Components
-
-* **[`PassthroughCamera`](./Assets/PassthroughCameraApiSamples/PassthroughCamera)** - C# classes and utilities for camera access
-* **[`StartScene`](./Assets/PassthroughCameraApiSamples/StartScene)** - Menu scene for switching between samples
-
-## Getting Started
-
-1. Clone the GitHub project as described [above](#download-the-project)
-2. Open the project with **Unity 6000.0.38f1** or newer
-3. Open a sample scene from the **[`PassthroughCameraApiSamples`](./Assets/PassthroughCameraApiSamples/)** folder
-4. Use **Meta > Tools > Project Setup Tool** to fix any configuration issues
-5. Build and deploy to your Quest 3/3S device
-
-For detailed setup instructions, API reference, and usage examples, see the **[Getting Started Guide](https://developers.meta.com/horizon/documentation/unity/unity-pca-documentation)**.
-
-## Learn More
-
-For comprehensive information about using the Passthrough Camera API:
-
-- **Setup & Configuration** - [Getting Started Guide](https://developers.meta.com/horizon/documentation/unity/unity-pca-documentation)
-- **Unity Inference Engine Integration** - [ML/CV with PCA](https://developers.meta.com/horizon/documentation/unity/unity-pca-sentis)
-- **Troubleshooting** - See the troubleshooting section in the [Getting Started Guide](https://developers.meta.com/horizon/documentation/unity/unity-pca-documentation#troubleshooting)
-
-## Report an Issue
-
-If you encounter any issues, please report them with:
-
-- **Unity Engine version**
-- **XR plugin** (Oculus XR or Open XR) and version number
-- **Quest device** model and **Horizon OS version**
-- **Logcat logs** (use `adb logcat >> log.txt`)
-- **Video or screenshot** of the issue
-- **Relevant information** about your use case
-
-## License
-
-The [`Oculus License`](./LICENSE.txt) applies to the SDK and supporting material. The [`MIT License`](./Assets/PassthroughCameraApiSamples/LICENSE.txt) applies to only certain, clearly marked documents. If an individual file does not indicate which license it is subject to, then the Oculus License applies.
-
-However,
-* Files from [`Assets/PassthroughCameraApiSamples/MultiObjectDetection/SentisInference/Model`](./Assets/PassthroughCameraApiSamples/MultiObjectDetection/SentisInference/Model) are licensed under [`MIT`](https://github.com/MultimediaTechLab/YOLO/blob/main/LICENSE).
-
-See the [`CONTRIBUTING`](./CONTRIBUTING.md) file for how to help out.
-
-## AI coding agents
-
-This repo is wired up for AI coding agents — `AGENTS.md`, `.vscode/extensions.json`, `.mcp.json`, `.cursor/rules/`, and a few client-specific dotfiles surface the **Meta Horizon** VS Code/Cursor extension, the `hzdb` MCP server, and the Meta Quest skill set automatically.
-
-Full toolchain, including Unity skills and per-client install instructions: [github.com/meta-quest/agentic-tools](https://github.com/meta-quest/agentic-tools).
+QuestTeleop is derived from Meta's
+**[Unity-PassthroughCameraApiSamples](https://github.com/oculus-samples/Unity-PassthroughCameraApiSamples)**
+and retains those samples and their license. See **`LICENSE.txt`**
+(© Meta Platforms, Inc.) and the per-sample license under
+`Assets/PassthroughCameraApiSamples/`. The `MultiObjectDetection` sample uses a
+YOLO model under MIT. The `VlaTeleop/` and `ReachyBridge/` bridges are additions
+by this project's authors.
