@@ -24,7 +24,7 @@ EditorBuildSettings:
     path: Assets/PassthroughCameraApiSamples/ShaderSample/ShaderSample.unity
     guid: 708e8dca6055146b28afe2481f141457
   - enabled: 1
-    path: Assets/ReachyQuest.unity
+    path: Assets/Scenes/ReachyQuest.unity
     guid: ea2dfa87baa3b4ff6b7b0f90bfa1ec62
   m_configObjects:
     Unity.XR.Oculus.Settings: {fileID: 11400000, guid: f2bf97b3acdb64248a707c407c9fc54e, type: 2}

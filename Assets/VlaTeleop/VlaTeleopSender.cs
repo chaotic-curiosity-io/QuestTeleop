@@ -26,10 +26,19 @@
 //   pos  (x,y,z)ros  = ( u.z, -u.x,  u.y)
 //   quat (x,y,z,w)ros = (-u.z,  u.x, -u.y, u.w)
 //
-// Packet schema (identical to the Viture sender):
-//   {"type":"xr_pose","seq":N,"t":ms,
+// Packet schema (superset of the Viture sender's; extra fields are ignored by
+// the old parsers, so the Viture path is untouched):
+//   {"type":"xr_pose","seq":N,"t":ms,"source":"quest",
 //    "head_pos":[3],"head_quat":[4],
-//    "left":{"visible":b,"wrist":[3],"landmarks":[63]}, "right":{...}}
+//    "left":{"visible":b,"conf":0..1,"wrist":[3],"wrist_quat":[4],"landmarks":[63]},
+//    "right":{...},
+//    "body":{"valid":b,"chest":[3],"l_shoulder":[3],"r_shoulder":[3]}}
+//
+// "conf" is OVRHand confidence (1 high, 0.5 low — low-confidence frames HOLD
+// on the Python side instead of chasing tracker noise). "body" carries the
+// body-tracked chest/shoulder anchors (QuestBodyAnchors) so the server can IK
+// from your MEASURED shoulders; when invalid the server falls back to the
+// virtual head-offset anchor. Run the server with --source quest-xr.
 
 using System;
 using System.Collections.Generic;
@@ -60,26 +69,59 @@ namespace VlaTeleop
         [Header("Debug")]
         public bool showHud = true;
 
+        [Header("Body tracking (optional)")]
+        [Tooltip("Body-tracked chest/shoulder anchors. Auto-found in the scene; " +
+                 "empty = the packet's body block stays invalid (server falls " +
+                 "back to the virtual chest anchor).")]
+        public QuestBodyAnchors bodyAnchors;
+
+        [Header("Logging")]
+        [Tooltip("Seconds between repeated heartbeat log lines (0 = off).")]
+        public float heartbeatSeconds = 5f;
+
         // ---- packet DTOs (JsonUtility) -------------------------------------- //
         [Serializable]
         public class HandPayload
         {
             public bool visible;
+            public float conf;                  // 1 high, 0.5 low, 0 untracked
             public float[] wrist = Empty;       // ROS frame, meters
+            public float[] wrist_quat = Empty;  // ROS frame, xyzw
             public float[] landmarks = Empty;   // 21*(x,y,z), ROS frame, metric
             static readonly float[] Empty = new float[0];
+        }
+
+        [Serializable]
+        public class BodyPayload
+        {
+            public bool valid;
+            public float[] chest = new float[3];       // ROS frame, meters
+            public float[] l_shoulder = new float[3];
+            public float[] r_shoulder = new float[3];
+            // FullBody (generative) legs — hip/knee/ankle/toe per side.
+            public bool legs_valid;
+            public float[] l_hip = new float[3];
+            public float[] r_hip = new float[3];
+            public float[] l_knee = new float[3];
+            public float[] r_knee = new float[3];
+            public float[] l_ankle = new float[3];
+            public float[] r_ankle = new float[3];
+            public float[] l_toe = new float[3];
+            public float[] r_toe = new float[3];
         }
 
         [Serializable]
         public class XrPosePacket
         {
             public string type = "xr_pose";
+            public string source = "quest";
             public int seq;
             public double t;                    // ms since startup
             public float[] head_pos = new float[3];
             public float[] head_quat = new float[4];
             public HandPayload left = new HandPayload();
             public HandPayload right = new HandPayload();
+            public BodyPayload body = new BodyPayload();
         }
 
         Socket _socket;
@@ -96,11 +138,16 @@ namespace VlaTeleop
         int _sent;
         string _lastError;
 
+        // heartbeat counters (reset each beat)
+        float _nextBeat;
+        int _beatSent, _beatLeft, _beatRight, _beatBody, _beatLegs, _beatLowConf, _beatSendErr;
+
         void Start()
         {
             if (rig == null) rig = FindObjectOfType<OVRCameraRig>();
             if (headTransform == null && rig != null) headTransform = rig.centerEyeAnchor;
             if (headTransform == null && Camera.main != null) headTransform = Camera.main.transform;
+            if (bodyAnchors == null) bodyAnchors = FindObjectOfType<QuestBodyAnchors>();
             AutoFindHands();
 
             if (headTransform == null)
@@ -143,9 +190,13 @@ namespace VlaTeleop
             {
                 var skel = h.GetComponent<OVRSkeleton>();
                 var type = skel != null ? skel.GetSkeletonType() : OVRSkeleton.SkeletonType.None;
+                bool typed = type == OVRSkeleton.SkeletonType.HandLeft
+                             || type == OVRSkeleton.SkeletonType.HandRight
+                             || type == OVRSkeleton.SkeletonType.XRHandLeft
+                             || type == OVRSkeleton.SkeletonType.XRHandRight;
                 bool isLeft = type == OVRSkeleton.SkeletonType.HandLeft
-                              || (type == OVRSkeleton.SkeletonType.None
-                                  && h.name.ToLowerInvariant().Contains("left"));
+                              || type == OVRSkeleton.SkeletonType.XRHandLeft
+                              || (!typed && h.name.ToLowerInvariant().Contains("left"));
                 if (isLeft && leftHand == null) { leftHand = h; leftSkeleton = skel; }
                 else if (!isLeft && rightHand == null) { rightHand = h; rightSkeleton = skel; }
             }
@@ -168,13 +219,65 @@ namespace VlaTeleop
 
             FillHand(_packet.left, leftHand, leftSkeleton);
             FillHand(_packet.right, rightHand, rightSkeleton);
+            FillBody(_packet.body);
 
             byte[] data = Encoding.UTF8.GetBytes(JsonUtility.ToJson(_packet));
             foreach (var ep in _targets)
             {
                 try { _socket.SendTo(data, ep); _lastError = null; }
-                catch (SocketException e) { _lastError = e.SocketErrorCode.ToString(); }
+                catch (SocketException e)
+                {
+                    _lastError = e.SocketErrorCode.ToString();
+                    _beatSendErr++;
+                }
             }
+
+            _beatSent++;
+            if (_packet.left.visible) _beatLeft++;
+            if (_packet.right.visible) _beatRight++;
+            if (_packet.body.valid) _beatBody++;
+            if (_packet.body.legs_valid) _beatLegs++;
+            if ((_packet.left.visible && _packet.left.conf < 0.9f)
+                || (_packet.right.visible && _packet.right.conf < 0.9f)) _beatLowConf++;
+            Heartbeat();
+        }
+
+        void Heartbeat()
+        {
+            if (heartbeatSeconds <= 0f || Time.unscaledTime < _nextBeat) return;
+            _nextBeat = Time.unscaledTime + heartbeatSeconds;
+            int n = Mathf.Max(1, _beatSent);
+            Debug.Log($"[VlaTeleop] hb sent:{_beatSent} ({_beatSent / heartbeatSeconds:0}/s)  "
+                      + $"L:{100 * _beatLeft / n}% R:{100 * _beatRight / n}% "
+                      + $"body:{100 * _beatBody / n}% legs:{100 * _beatLegs / n}% "
+                      + $"lowConf:{_beatLowConf} sendErr:{_beatSendErr}"
+                      + (_lastError != null ? $" last:{_lastError}" : ""));
+            _beatSent = _beatLeft = _beatRight = _beatBody = _beatLegs = _beatLowConf = _beatSendErr = 0;
+        }
+
+        void FillBody(BodyPayload body)
+        {
+            bool ok = bodyAnchors != null && bodyAnchors.IsValid;
+            body.valid = ok;
+            body.legs_valid = ok && bodyAnchors.LegsValid;
+            if (!ok) return;
+            WriteRosVec(bodyAnchors.Chest, body.chest);
+            WriteRosVec(bodyAnchors.LeftShoulder, body.l_shoulder);
+            WriteRosVec(bodyAnchors.RightShoulder, body.r_shoulder);
+            if (!body.legs_valid) return;
+            WriteRosVec(bodyAnchors.LeftHip, body.l_hip);
+            WriteRosVec(bodyAnchors.RightHip, body.r_hip);
+            WriteRosVec(bodyAnchors.LeftKnee, body.l_knee);
+            WriteRosVec(bodyAnchors.RightKnee, body.r_knee);
+            WriteRosVec(bodyAnchors.LeftAnkle, body.l_ankle);
+            WriteRosVec(bodyAnchors.RightAnkle, body.r_ankle);
+            WriteRosVec(bodyAnchors.LeftToe, body.l_toe);
+            WriteRosVec(bodyAnchors.RightToe, body.r_toe);
+        }
+
+        static void WriteRosVec(Vector3 u, float[] ros)
+        {
+            ros[0] = u.z; ros[1] = -u.x; ros[2] = u.y;
         }
 
         void FillHand(HandPayload payload, OVRHand hand, OVRSkeleton skel)
@@ -184,10 +287,13 @@ namespace VlaTeleop
             payload.visible = tracked;
             if (!tracked)
             {
+                payload.conf = 0f;
                 payload.wrist = new float[0];
+                payload.wrist_quat = new float[0];
                 payload.landmarks = new float[0];
                 return;
             }
+            payload.conf = hand.IsDataHighConfidence ? 1f : 0.5f;
 
             // 21 metric world joints (MediaPipe order) -> ROS frame, flat 63.
             if (payload.landmarks == null || payload.landmarks.Length != 63)
@@ -208,6 +314,22 @@ namespace VlaTeleop
             payload.wrist[0] = wr.z;
             payload.wrist[1] = -wr.x;
             payload.wrist[2] = wr.y;
+
+            // Native wrist orientation (ROS xyzw) — spare data for wrist-
+            // equipped robots; the H1 path ignores it.
+            if (QuestHandLandmarks.TryWristRotation(skel, out Quaternion q))
+            {
+                if (payload.wrist_quat == null || payload.wrist_quat.Length != 4)
+                    payload.wrist_quat = new float[4];
+                payload.wrist_quat[0] = -q.z;
+                payload.wrist_quat[1] = q.x;
+                payload.wrist_quat[2] = -q.y;
+                payload.wrist_quat[3] = q.w;
+            }
+            else
+            {
+                payload.wrist_quat = new float[0];
+            }
         }
 
         static void WriteRosPose(Vector3 p, Quaternion q, float[] pos, float[] quat)
@@ -222,9 +344,10 @@ namespace VlaTeleop
             string hands = _packet.left.visible || _packet.right.visible
                 ? $"hands L:{(_packet.left.visible ? "✓" : "–")} R:{(_packet.right.visible ? "✓" : "–")}"
                 : "hands: none";
+            string body = _packet.body.valid ? "body:✓" : "body:–";
             string err = _lastError != null ? $"  send:{_lastError}" : "";
             GUI.Label(new Rect(10, 10, 640, 22),
-                      $"VLA teleop  sent:{_sent}  {hands}{err}");
+                      $"VLA teleop  sent:{_sent}  {hands}  {body}{err}");
         }
     }
 }

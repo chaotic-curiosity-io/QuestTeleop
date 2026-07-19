@@ -59,6 +59,7 @@ namespace VlaTeleop
         public Color leftColor = new Color(0f, 0.86f, 1f);
         public Color rightColor = new Color(1f, 0.47f, 0f);
         public Color robotColor = new Color(0.3f, 1f, 0.4f);
+        public Color bodyColor = new Color(1f, 0.2f, 0.9f);   // measured (body-tracked) anchors
 
         // Inverse of VlaTeleopSender's Unity->ROS pos map (ros = (u.z,-u.x,u.y)).
         static Vector3 RosToUnity(float[] r) => new Vector3(-r[1], r[2], r[0]);
@@ -106,6 +107,31 @@ namespace VlaTeleop
                     Handles.Label(shR + up * 0.03f, "R shoulder");
                 }
 #endif
+            }
+
+            // Body-tracked anchors from the wire packet: when valid, the server
+            // IKs from THESE, so the shoulder->wrist arrows re-anchor to them
+            // (virtual anchors above stay as the faint fallback reference).
+            bool bodyValid = pkt.body != null && pkt.body.valid;
+            if (bodyValid)
+            {
+                Vector3 bChest = RosToUnity(pkt.body.chest);
+                Vector3 bL = RosToUnity(pkt.body.l_shoulder);
+                Vector3 bR = RosToUnity(pkt.body.r_shoulder);
+                Gizmos.color = bodyColor;
+                Gizmos.DrawWireSphere(bChest, markerRadius * 0.8f);
+                Gizmos.DrawSphere(bL, markerRadius * 0.9f);
+                Gizmos.DrawSphere(bR, markerRadius * 0.9f);
+                Gizmos.DrawLine(bL, bR);
+#if UNITY_EDITOR
+                if (drawLabels)
+                {
+                    Handles.Label(bL + up * 0.05f, "L shoulder (tracked)");
+                    Handles.Label(bR + up * 0.05f, "R shoulder (tracked)");
+                }
+#endif
+                shL = bL;                      // arrows anchor where the server anchors
+                shR = bR;
             }
 
             if (drawTargets)

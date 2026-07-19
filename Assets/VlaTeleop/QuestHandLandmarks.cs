@@ -39,17 +39,51 @@ namespace VlaTeleop
         //   9..12 middle
         //   13..16 ring
         //   17..20 pinky
-        // Mapped to the OVRPlugin hand skeleton bone ids. OVR's thumb carries a
-        // Thumb0 (trapezium/CMC) + Thumb1..3; we take Thumb0/1/2 for CMC/MCP/IP
-        // and ThumbTip for the tip (Thumb3 has no MediaPipe equivalent). OVR's
-        // Pinky0 is the metacarpal (no MediaPipe slot); Pinky1..3 + tip fill
-        // MCP/PIP/DIP/TIP like the other fingers.
-        static readonly OVRSkeleton.BoneId[] Map =
+        //
+        // TWO bone-id maps, selected per skeleton at runtime: with the OpenXR
+        // plugin (this project) OVRSkeleton reports SkeletonType.XRHandLeft/
+        // Right whose Bones carry XRHand_* ids — the legacy Hand_* ids are a
+        // DIFFERENT numeric range, so comparing against them silently matches
+        // the wrong bones (that was the scrambled middle/ring + dead thumb).
+        //
+        // XR set (OpenXR EXT_hand_tracking joints): each *Proximal bone's
+        // origin is the MCP joint, *Intermediate = PIP, *Distal = DIP.
+        // Thumb: Metacarpal origin = CMC, Proximal = MCP, Distal = IP.
+        static readonly OVRSkeleton.BoneId[] XrMap =
+        {
+            OVRSkeleton.BoneId.XRHand_Wrist,               // 0  wrist
+            OVRSkeleton.BoneId.XRHand_ThumbMetacarpal,     // 1  thumb CMC
+            OVRSkeleton.BoneId.XRHand_ThumbProximal,       // 2  thumb MCP
+            OVRSkeleton.BoneId.XRHand_ThumbDistal,         // 3  thumb IP
+            OVRSkeleton.BoneId.XRHand_ThumbTip,            // 4  thumb TIP
+            OVRSkeleton.BoneId.XRHand_IndexProximal,       // 5  index MCP
+            OVRSkeleton.BoneId.XRHand_IndexIntermediate,   // 6  index PIP
+            OVRSkeleton.BoneId.XRHand_IndexDistal,         // 7  index DIP
+            OVRSkeleton.BoneId.XRHand_IndexTip,            // 8  index TIP
+            OVRSkeleton.BoneId.XRHand_MiddleProximal,      // 9  middle MCP
+            OVRSkeleton.BoneId.XRHand_MiddleIntermediate,  // 10 middle PIP
+            OVRSkeleton.BoneId.XRHand_MiddleDistal,        // 11 middle DIP
+            OVRSkeleton.BoneId.XRHand_MiddleTip,           // 12 middle TIP
+            OVRSkeleton.BoneId.XRHand_RingProximal,        // 13 ring MCP
+            OVRSkeleton.BoneId.XRHand_RingIntermediate,    // 14 ring PIP
+            OVRSkeleton.BoneId.XRHand_RingDistal,          // 15 ring DIP
+            OVRSkeleton.BoneId.XRHand_RingTip,             // 16 ring TIP
+            OVRSkeleton.BoneId.XRHand_LittleProximal,      // 17 pinky MCP
+            OVRSkeleton.BoneId.XRHand_LittleIntermediate,  // 18 pinky PIP
+            OVRSkeleton.BoneId.XRHand_LittleDistal,        // 19 pinky DIP
+            OVRSkeleton.BoneId.XRHand_LittleTip,           // 20 pinky TIP
+        };
+
+        // Legacy OVR set: Thumb0 is the trapezium; joint ORIGINS put Thumb1 at
+        // the CMC, Thumb2 at the MCP, Thumb3 at the IP (the old Thumb0/1/2 map
+        // was off by one — dead thumb pitch). Pinky0 (metacarpal) has no
+        // MediaPipe slot.
+        static readonly OVRSkeleton.BoneId[] LegacyMap =
         {
             OVRSkeleton.BoneId.Hand_WristRoot,   // 0  wrist
-            OVRSkeleton.BoneId.Hand_Thumb0,      // 1  thumb CMC
-            OVRSkeleton.BoneId.Hand_Thumb1,      // 2  thumb MCP
-            OVRSkeleton.BoneId.Hand_Thumb2,      // 3  thumb IP
+            OVRSkeleton.BoneId.Hand_Thumb1,      // 1  thumb CMC
+            OVRSkeleton.BoneId.Hand_Thumb2,      // 2  thumb MCP
+            OVRSkeleton.BoneId.Hand_Thumb3,      // 3  thumb IP
             OVRSkeleton.BoneId.Hand_ThumbTip,    // 4  thumb TIP
             OVRSkeleton.BoneId.Hand_Index1,      // 5  index MCP
             OVRSkeleton.BoneId.Hand_Index2,      // 6  index PIP
@@ -69,6 +103,14 @@ namespace VlaTeleop
             OVRSkeleton.BoneId.Hand_PinkyTip,    // 20 pinky TIP
         };
 
+        static OVRSkeleton.BoneId[] MapFor(OVRSkeleton skel)
+        {
+            var t = skel.GetSkeletonType();
+            bool xr = t == OVRSkeleton.SkeletonType.XRHandLeft
+                      || t == OVRSkeleton.SkeletonType.XRHandRight;
+            return xr ? XrMap : LegacyMap;
+        }
+
         public const int Count = 21;   // MediaPipe landmark count
 
         /// <summary>
@@ -86,12 +128,13 @@ namespace VlaTeleop
                 || world.Length < Count)
                 return false;
 
-            // OVRSkeleton.Bones is indexed by BoneId for hands, but we resolve by
-            // Id to be robust to ordering/version differences.
+            // Resolve by bone Id against the map matching this skeleton's
+            // version (XRHand_* under OpenXR, legacy Hand_* otherwise).
+            var map = MapFor(skel);
             bool wroteWrist = false;
             for (int i = 0; i < Count; i++)
             {
-                if (TryBone(skel, Map[i], out Vector3 p))
+                if (TryBone(skel, map[i], out Vector3 p))
                 {
                     world[i] = p;
                     if (i == 0) wroteWrist = true;
@@ -108,6 +151,25 @@ namespace VlaTeleop
                 }
             }
             return wroteWrist;
+        }
+
+        /// <summary>World-space wrist rotation (Hand_WristRoot bone). Quest's
+        /// native wrist orientation — unused by the H1 (no wrist joints) but
+        /// carried in the packet for wrist-equipped robots later.</summary>
+        public static bool TryWristRotation(OVRSkeleton skel, out Quaternion worldRot)
+        {
+            worldRot = Quaternion.identity;
+            if (skel == null || !skel.IsDataValid || skel.Bones == null) return false;
+            var wristId = MapFor(skel)[0];
+            foreach (var b in skel.Bones)
+            {
+                if (b != null && b.Id == wristId && b.Transform != null)
+                {
+                    worldRot = b.Transform.rotation;
+                    return true;
+                }
+            }
+            return false;
         }
 
         static bool TryBone(OVRSkeleton skel, OVRSkeleton.BoneId id, out Vector3 worldPos)

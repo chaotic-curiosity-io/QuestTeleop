@@ -44,6 +44,20 @@ namespace VlaTeleop.EditorTools
             var gizmos = GetOrAdd<VlaTeleopGizmos>(teleop);
             gizmos.sender = sender;
 
+            // Body-tracked shoulder anchors: OVRBody poses are tracking-space,
+            // so the anchors GameObject lives UNDER trackingSpace (identity).
+            var anchors = Object.FindObjectOfType<QuestBodyAnchors>();
+            if (anchors == null && rig.trackingSpace != null)
+            {
+                var go = new GameObject("BodyTrackingAnchors");
+                Undo.RegisterCreatedObjectUndo(go, "Create BodyTrackingAnchors");
+                go.transform.SetParent(rig.trackingSpace, false);
+                anchors = go.AddComponent<QuestBodyAnchors>();
+                anchors.trackingSpace = rig.trackingSpace;
+            }
+            sender.bodyAnchors = anchors;
+            EnableBodyTracking();
+
             EditorSceneManager.MarkSceneDirty(EditorSceneManager.GetActiveScene());
             Selection.activeGameObject = teleop;
 
@@ -53,12 +67,15 @@ namespace VlaTeleop.EditorTools
                 (haveHands ? "native OVRHand found (auto-bound at Play)."
                            : "NONE in scene — enable Hand Tracking and use a rig with " +
                              "OVRHand anchors, or the stream is head-only.") +
-                "\nNext: 1) build+run on the Quest (ReachyBridge ▸ Build and Run works for " +
-                "this scene too); 2) on the Mac: openvla-unity-sim2real/handtracking/" +
-                "run_xr_teleop.sh --robot h1  (NO --swap-hands — Quest knows handedness); " +
-                "point the headset's UDP host at the Mac if not on localhost (edit the " +
-                "sender's endpoints); 3) in DevVLA run VLA/Setup Hand Humanoid Scene/Unitree " +
-                "H1 + VLA/Teleop Mode/Arms + Hands + Head (Viture) and press Play.");
+                " Body anchors: " + (sender.bodyAnchors != null
+                    ? "QuestBodyAnchors wired (measured shoulders when tracking is up)."
+                    : "NOT wired (no trackingSpace?) — server falls back to the virtual chest.") +
+                "\nNext: 1) Tools ▸ Robot Teleop ▸ Start Teleop Server (Quest → H1) — " +
+                "runs teleop_server.py --source quest-xr (exact URDF arm map + " +
+                "profiles/quest_h1.json, NO --swap-hands); 2) in DevVLA run VLA/Setup Hand " +
+                "Humanoid Scene/Unitree H1 + VLA/Teleop Mode/Arms + Hands + Head (Viture) " +
+                "and press Play; 3) press Play here (over Link, enable Developer runtime " +
+                "features + body tracking in the Meta Quest Link app, or build to device).");
         }
 
         [MenuItem("Tools/Robot Teleop/Open README", priority = 20)]
@@ -68,6 +85,30 @@ namespace VlaTeleop.EditorTools
             var obj = AssetDatabase.LoadAssetAtPath<TextAsset>(path);
             if (obj != null) AssetDatabase.OpenAsset(obj);
             else Debug.LogWarning($"[VlaTeleop] README not found at {path}");
+        }
+
+        /// <summary>Body tracking needs OVRManager consent: the on-startup
+        /// permission request (device builds) — set via SerializedObject since
+        /// the field is internal. Over Link, enable "Developer runtime
+        /// features" + body tracking in the Meta Quest Link PC app.</summary>
+        static void EnableBodyTracking()
+        {
+            var mgr = Object.FindObjectOfType<OVRManager>();
+            if (mgr == null)
+            {
+                Debug.LogWarning("[VlaTeleop] No OVRManager in scene — body tracking "
+                                 + "permission not configured.");
+                return;
+            }
+            var so = new SerializedObject(mgr);
+            var prop = so.FindProperty("requestBodyTrackingPermissionOnStartup");
+            if (prop != null && !prop.boolValue)
+            {
+                prop.boolValue = true;
+                so.ApplyModifiedProperties();
+                Debug.Log("[VlaTeleop] OVRManager: body-tracking permission request "
+                          + "on startup ENABLED.");
+            }
         }
 
         // ---- helpers ------------------------------------------------------- //
