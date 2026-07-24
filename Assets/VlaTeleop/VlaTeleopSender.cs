@@ -51,6 +51,17 @@ namespace VlaTeleop
 {
     public class VlaTeleopSender : MonoBehaviour
     {
+        /// <summary>Teleop scope — which joint groups the SERVER drives from
+        /// this stream (masked server-side per frame; masked groups hold their
+        /// last targets). Rides in every packet as "mode"; the server echoes
+        /// the honored mode back in joint_targets for the ghost HUD.</summary>
+        public enum TeleopMode
+        {
+            FullBody,    // fingers + arms + torso + head + legs
+            UpperBody,   // fingers + arms + torso + head
+            HandsOnly,   // finger curls only
+        }
+
         [Header("Sources (auto-found if left empty)")]
         [Tooltip("The OVR rig; head pose is read from its centerEyeAnchor. Falls back to Camera.main.")]
         public OVRCameraRig rig;
@@ -65,6 +76,13 @@ namespace VlaTeleop
         [Tooltip("host:port UDP endpoints. Defaults: teleop_server.py --source viture-xr (:9905) and DevVLA TeleopHeadCamera (:9906).")]
         public string[] endpoints = { "127.0.0.1:9905", "127.0.0.1:9906" };
         [Range(5f, 90f)] public float sendHz = 30f;
+
+        [Header("Teleop mode")]
+        [Tooltip("Which joint groups the server drives. Cycle in VR with a " +
+                 "double MIDDLE-finger pinch on either hand (index double " +
+                 "pinch is the server's record toggle), or via the component " +
+                 "context menu.")]
+        public TeleopMode mode = TeleopMode.FullBody;
 
         [Header("Debug")]
         public bool showHud = true;
@@ -117,12 +135,20 @@ namespace VlaTeleop
             public string source = "quest";
             public int seq;
             public double t;                    // ms since startup
+            public string mode = "full_body";   // teleop scope (server masks)
             public float[] head_pos = new float[3];
             public float[] head_quat = new float[4];
             public HandPayload left = new HandPayload();
             public HandPayload right = new HandPayload();
             public BodyPayload body = new BodyPayload();
         }
+
+        static string ModeString(TeleopMode m) => m switch
+        {
+            TeleopMode.UpperBody => "upper_body",
+            TeleopMode.HandsOnly => "hands_only",
+            _ => "full_body",
+        };
 
         Socket _socket;
         readonly List<IPEndPoint> _targets = new List<IPEndPoint>();
@@ -132,6 +158,10 @@ namespace VlaTeleop
         /// handle for overlay/gizmo tools (VlaTeleopGizmos) so they draw EXACTLY what
         /// went on the wire, not a re-derivation.</summary>
         public XrPosePacket LastPacket => _packet;
+
+        /// <summary>Read-only metrics for HUD panels (VlaTeleopHudPanel).</summary>
+        public int SentCount => _sent;
+        public string LastSendError => _lastError;
 
         readonly Vector3[] _world21 = new Vector3[QuestHandLandmarks.Count];
         float _nextSend;
@@ -207,13 +237,21 @@ namespace VlaTeleop
             try { _socket?.Close(); } catch { }
         }
 
+        // Mode-cycle gesture state (double MIDDLE pinch, either hand).
+        readonly float[] _lastMiddleDown = { -10f, -10f };
+        readonly bool[] _middleWas = new bool[2];
+        float _modeDebounce;
+
         void Update()
         {
+            DetectModeGesture();
+
             if (Time.unscaledTime < _nextSend) return;
             _nextSend = Time.unscaledTime + 1f / Mathf.Max(5f, sendHz);
 
             _packet.seq = ++_sent;
             _packet.t = Time.unscaledTimeAsDouble * 1000.0;
+            _packet.mode = ModeString(mode);
             WriteRosPose(headTransform.position, headTransform.rotation,
                          _packet.head_pos, _packet.head_quat);
 
@@ -240,6 +278,42 @@ namespace VlaTeleop
             if ((_packet.left.visible && _packet.left.conf < 0.9f)
                 || (_packet.right.visible && _packet.right.conf < 0.9f)) _beatLowConf++;
             Heartbeat();
+        }
+
+        /// <summary>Double MIDDLE-finger pinch (shut → open → shut inside
+        /// 1.5 s) on either hand cycles the teleop mode. Index double pinch
+        /// is untouched — that one is the server's raw-recording toggle.</summary>
+        void DetectModeGesture()
+        {
+            if (Time.unscaledTime < _modeDebounce) return;
+            var hands = new[] { leftHand, rightHand };
+            for (int i = 0; i < 2; i++)
+            {
+                var h = hands[i];
+                if (h == null || !h.IsTracked) { _middleWas[i] = false; continue; }
+                bool now = h.GetFingerIsPinching(OVRHand.HandFinger.Middle);
+                if (now && !_middleWas[i])                       // rising edge
+                {
+                    if (Time.unscaledTime - _lastMiddleDown[i] < 1.5f)
+                    {
+                        CycleMode();
+                        _modeDebounce = Time.unscaledTime + 1f;
+                        _lastMiddleDown[i] = -10f;
+                    }
+                    else
+                    {
+                        _lastMiddleDown[i] = Time.unscaledTime;
+                    }
+                }
+                _middleWas[i] = now;
+            }
+        }
+
+        [ContextMenu("Cycle Mode")]
+        public void CycleMode()
+        {
+            mode = (TeleopMode)(((int)mode + 1) % 3);
+            Debug.Log($"[VlaTeleop] teleop mode -> {mode}");
         }
 
         void Heartbeat()
@@ -342,12 +416,19 @@ namespace VlaTeleop
         {
             if (!showHud) return;
             string hands = _packet.left.visible || _packet.right.visible
-                ? $"hands L:{(_packet.left.visible ? "✓" : "–")} R:{(_packet.right.visible ? "✓" : "–")}"
+                ? $"hands L:{HandMark(_packet.left)} R:{HandMark(_packet.right)}"
                 : "hands: none";
-            string body = _packet.body.valid ? "body:✓" : "body:–";
+            string body = _packet.body.valid
+                ? (_packet.body.legs_valid ? "body:✓ legs:✓" : "body:✓ legs:–")
+                : "body:–";
             string err = _lastError != null ? $"  send:{_lastError}" : "";
-            GUI.Label(new Rect(10, 10, 640, 22),
-                      $"VLA teleop  sent:{_sent}  {hands}  {body}{err}");
+            GUI.Label(new Rect(10, 10, 760, 22),
+                      $"VLA teleop  sent:{_sent}  {hands}  {body}  " +
+                      $"mode:{mode}{err}");
         }
+
+        /// <summary>✓ high conf, ~ low conf (server HOLDs those frames), – untracked.</summary>
+        static string HandMark(HandPayload h)
+            => !h.visible ? "–" : (h.conf >= 0.9f ? "✓" : "~");
     }
 }

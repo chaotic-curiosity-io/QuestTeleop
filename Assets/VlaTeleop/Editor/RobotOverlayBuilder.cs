@@ -68,16 +68,46 @@ namespace VlaTeleop.EditorTools
             public float mimicMult = 1f, mimicOff;
         }
 
+        const string Gr1UrdfPath =
+            "Assets/VlaTeleop/Robots/gr1t2_description/gr1t2_fourier_hand_6dof.urdf";
+        const string Gr1GhostRootName = "GR1Ghost";
+        const string G1UrdfPath =
+            "Assets/VlaTeleop/Robots/g1_description/g1_29dof_with_hand_rev_1_0.urdf";
+        const string G1GhostRootName = "G1Ghost";
+
         [MenuItem("Tools/Robot Teleop/Robot Overlay/Build H1 Ghost", priority = 40)]
         public static void BuildH1Ghost()
         {
-            Build(UrdfPath, GhostRootName, "h1");
+            Build(UrdfPath, GhostRootName, "h1",
+                  "Expected for H1: 33 actuated + 12 mimic.");
         }
 
-        [MenuItem("Tools/Robot Teleop/Robot Overlay/Remove H1 Ghost", priority = 41)]
-        public static void RemoveH1Ghost()
+        [MenuItem("Tools/Robot Teleop/Robot Overlay/Build GR-1 Ghost", priority = 41)]
+        public static void BuildGr1Ghost()
         {
-            var go = GameObject.Find(GhostRootName);
+            Build(Gr1UrdfPath, Gr1GhostRootName, "gr1",
+                  "Expected for GR-1: 44 actuated + 10 mimic.");
+        }
+
+        [MenuItem("Tools/Robot Teleop/Robot Overlay/Build G1 Ghost", priority = 42)]
+        public static void BuildG1Ghost()
+        {
+            Build(G1UrdfPath, G1GhostRootName, "g1_dex3",
+                  "Expected for G1: 43 actuated + 0 mimic.");
+        }
+
+        [MenuItem("Tools/Robot Teleop/Robot Overlay/Remove H1 Ghost", priority = 43)]
+        public static void RemoveH1Ghost() => RemoveGhost(GhostRootName);
+
+        [MenuItem("Tools/Robot Teleop/Robot Overlay/Remove GR-1 Ghost", priority = 44)]
+        public static void RemoveGr1Ghost() => RemoveGhost(Gr1GhostRootName);
+
+        [MenuItem("Tools/Robot Teleop/Robot Overlay/Remove G1 Ghost", priority = 45)]
+        public static void RemoveG1Ghost() => RemoveGhost(G1GhostRootName);
+
+        static void RemoveGhost(string rootName)
+        {
+            var go = GameObject.Find(rootName);
             if (go == null) { Debug.Log("[RobotOverlay] No ghost in scene."); return; }
             Undo.DestroyObjectImmediate(go);
             EditorSceneManager.MarkSceneDirty(EditorSceneManager.GetActiveScene());
@@ -86,7 +116,8 @@ namespace VlaTeleop.EditorTools
 
         // ---- build ----------------------------------------------------------- //
 
-        static void Build(string urdfAssetPath, string rootName, string robotName)
+        static void Build(string urdfAssetPath, string rootName, string robotName,
+                          string expectedNote)
         {
             string absUrdf = Path.GetFullPath(urdfAssetPath);
             if (!File.Exists(absUrdf))
@@ -173,7 +204,7 @@ namespace VlaTeleop.EditorTools
                       $"{meshCount} meshes" +
                       (missingMesh > 0 ? $" ({missingMesh} MISSING — check the staged assets)" : "") +
                       $", feetToPelvis={ghost.feetToPelvis:0.###} m. " +
-                      "Expected for H1: 33 actuated + 12 mimic. Rest pose should stand " +
+                      expectedNote + " Rest pose should stand " +
                       "upright facing +Z. Play with the teleop server running " +
                       "(--source quest-xr) to see it move; RobotOverlayDriver listens " +
                       $"on udp :{driver.listenPort}.");
@@ -235,6 +266,14 @@ namespace VlaTeleop.EditorTools
             if (v.mesh != null)
             {
                 string meshPath = assetDir + "/" + v.mesh.Replace('\\', '/');
+                bool isStl = meshPath.ToLowerInvariant().EndsWith(".stl");
+                // STL: the staged asset is the URDF-Importer's baked prefab
+                // (xxx.prefab + xxx_0.asset next to where xxx.STL would be).
+                // Its vertices are ALREADY Ros2Unity-converted ((x,y,z)ros ->
+                // (-y,z,x)unity, winding flipped) by StlImporter at bake time,
+                // so unlike .dae there is NO orientation fix to apply.
+                if (isStl)
+                    meshPath = meshPath.Substring(0, meshPath.Length - 4) + ".prefab";
                 var prefab = AssetDatabase.LoadAssetAtPath<GameObject>(meshPath);
                 if (prefab == null)
                 {

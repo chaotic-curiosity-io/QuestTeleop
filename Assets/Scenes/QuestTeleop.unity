@@ -19385,6 +19385,7 @@ MonoBehaviour:
   - 127.0.0.1:9905
   - 127.0.0.1:9906
   sendHz: 30
+  mode: 0
   showHud: 1
   bodyAnchors: {fileID: 0}
   heartbeatSeconds: 5

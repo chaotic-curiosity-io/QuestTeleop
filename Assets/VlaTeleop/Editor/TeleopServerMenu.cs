@@ -35,6 +35,12 @@ namespace VlaTeleop.EditorTools
         [MenuItem("Tools/Robot Teleop/Start Teleop Server (Quest → H1)", priority = 40)]
         public static void StartServer() => StartServer("h1");
 
+        [MenuItem("Tools/Robot Teleop/Start Teleop Server (Quest → GR-1)", priority = 41)]
+        public static void StartServerGr1() => StartServer("gr1");
+
+        [MenuItem("Tools/Robot Teleop/Start Teleop Server (Quest → G1)", priority = 42)]
+        public static void StartServerG1() => StartServer("g1_dex3");
+
         static void StartServer(string robot)
         {
             if (RunningPid() > 0)
@@ -55,7 +61,11 @@ namespace VlaTeleop.EditorTools
                 return;
             }
 
-            string args = $"--robot {robot} --source quest-xr";
+            // --record-raw ARMS the raw-episode recorder (does not start it):
+            // a double pinch in VR toggles recording; episodes land under
+            // handtracking/episodes/ as teleop_raw_v1 for the fine-tune
+            // pipeline (retarget_episode.py -> episode_quality.py -> LeRobot).
+            string args = $"--robot {robot} --source quest-xr --record-raw episodes";
             // cmd /k keeps the console open (it IS the live heartbeat log, and
             // errors stay readable after exit).
             var psi = new ProcessStartInfo
@@ -82,7 +92,7 @@ namespace VlaTeleop.EditorTools
             }
         }
 
-        [MenuItem("Tools/Robot Teleop/Stop Teleop Server", priority = 41)]
+        [MenuItem("Tools/Robot Teleop/Stop Teleop Server", priority = 42)]
         public static void StopServer()
         {
             int pid = RunningPid();
@@ -107,7 +117,7 @@ namespace VlaTeleop.EditorTools
         [MenuItem("Tools/Robot Teleop/Stop Teleop Server", validate = true)]
         static bool ValidateStop() => RunningPid() > 0;
 
-        [MenuItem("Tools/Robot Teleop/Open Server Logs Folder", priority = 42)]
+        [MenuItem("Tools/Robot Teleop/Open Server Logs Folder", priority = 43)]
         public static void OpenLogs()
         {
             string logs = Path.Combine(HandtrackingPath, "logs");
@@ -115,7 +125,7 @@ namespace VlaTeleop.EditorTools
             EditorUtility.RevealInFinder(logs);
         }
 
-        [MenuItem("Tools/Robot Teleop/Set Handtracking Folder…", priority = 43)]
+        [MenuItem("Tools/Robot Teleop/Set Handtracking Folder…", priority = 44)]
         public static void SetPath()
         {
             string picked = EditorUtility.OpenFolderPanel(

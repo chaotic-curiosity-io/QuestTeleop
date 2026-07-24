@@ -64,7 +64,16 @@ remaps the native `OVRSkeleton` bones into that order. **No Python change.**
    Scene**. (Hand tracking is already enabled in this project.)
 2. **Tools ▸ Robot Teleop ▸ Add VLA Teleop Sender** — adds a `RobotTeleop`
    object with `VlaTeleopSender` (auto-binds the rig + both `OVRHand`s at Play)
-   and `VlaTeleopGizmos` (torso + arm-target debug overlay).
+   and `VlaTeleopGizmos` (torso + arm-target debug overlay). It also creates
+   the `BodyTrackingAnchors` object and runs **Enable Body Tracking** (below),
+   so `body:✓` should light up without extra steps.
+   - **Tools ▸ Robot Teleop ▸ Enable Body Tracking (Project + Scene)** flips
+     everything body tracking needs in one click: the OVRProjectConfig
+     capability, the `BODY_TRACKING` entry in the custom AndroidManifest, the
+     OVRManager startup permission prompt, and warns if the runtime joint set
+     isn't FullBody (legs need it). Over Link ALSO enable "Developer runtime
+     features" + body tracking in the Meta Quest Link PC app — without it the
+     HUD stays `body:–` even though everything above is on.
 3. **Standalone build → the endpoints MUST be the Mac's LAN IP**, not
    `127.0.0.1` (on the deployed APK, localhost is the *headset*). Edit the
    sender's **endpoints** to your Mac, e.g. `192.168.1.152:9905` (teleop server)
@@ -75,14 +84,18 @@ remaps the native `OVRSkeleton` bones into that order. **No Python change.**
 ## Server / robot side
 
 Easiest (same PC, editor Play mode over Link): **Tools ▸ Robot Teleop ▸ Start
-Teleop Server (Quest → H1)** — spawns the server in its own console window
-(that window is the live heartbeat log; Stop / Open Server Logs Folder / Set
-Handtracking Folder… live in the same menu). Equivalent shell command:
+Teleop Server (Quest → H1)** (or **… (Quest → GR-1)**) — spawns the server in
+its own console window (that window is the live heartbeat log; Stop / Open
+Server Logs Folder / Set Handtracking Folder… live in the same menu). The menu
+passes `--record-raw episodes`, which ARMS the raw-episode recorder — a
+**double pinch** (thumb+index, both hands) toggles recording; see "Recording
+for fine-tuning" below. Equivalent shell command:
 
 ```bash
 cd openvla-unity-sim2real/handtracking
 uv run --no-project --with numpy --with websockets \
-    python teleop_server.py --robot h1 --source quest-xr   # NO --swap-hands on Quest
+    python teleop_server.py --robot h1 --source quest-xr \
+    --record-raw episodes                      # NO --swap-hands on Quest
 ```
 
 For a STANDALONE headset over the LAN add `--xr-host 0.0.0.0` (receivers
@@ -106,16 +119,69 @@ g1_dex3}` selects the embodiment.
 | `VlaTeleopGizmos.cs` | virtual torso + measured (magenta) shoulders + shoulder→wrist arm-target overlay |
 | `Editor/VlaTeleopSceneSetup.cs` | **Tools ▸ Robot Teleop** scene setup menu |
 | `Editor/TeleopServerMenu.cs` | **Tools ▸ Robot Teleop** start/stop the Python server, open logs |
-| `RobotOverlayGhost.cs` | kinematic FK poser for the semi-transparent robot ghost (33 actuated + 12 mimic joints by URDF name) |
-| `RobotOverlayDriver.cs` | UDP :9907 `joint_targets` listener + anchors the ghost to the player (Superimposed / InFront) |
-| `Editor/RobotOverlayBuilder.cs` | **Tools ▸ Robot Teleop ▸ Robot Overlay** — builds the H1 ghost from `Robots/h1_description/h1_with_hand.urdf` (no URDF-Importer dependency) |
+| `RobotOverlayGhost.cs` | kinematic FK poser for the semi-transparent robot ghost (joints matched by URDF name — robot-agnostic) |
+| `RobotOverlayDriver.cs` | UDP :9907 `joint_targets` listener + anchors the ghost to the player (Superimposed / InFront); HUD with rate/drops/staleness + red **● REC** indicator |
+| `Editor/RobotOverlayBuilder.cs` | **Tools ▸ Robot Teleop ▸ Robot Overlay** — builds the H1 or GR-1 ghost from the staged URDFs (no URDF-Importer dependency; `.dae` via the Collada fix, `.STL` via pre-baked importer prefabs) |
 | `Robots/h1_description/` | staged H1 URDF + visual `.dae` meshes (BSD-3, see `Robots/ATTRIBUTION.md`) |
+| `Robots/gr1t2_description/` | staged GR-1 T2 URDF + baked STL mesh prefabs (see `Robots/ATTRIBUTION.md`) |
+| `Robots/g1_description/` | staged Unitree G1 (29 DoF + Dex3) URDF + baked STL mesh prefabs |
+| `VlaTeleopHudPanel.cs` | in-VR floating metrics panel (world-space canvas, lazy follow) — the OnGUI HUDs are PC-mirror-only |
+
+## HUD (what the two lines mean)
+
+```
+VLA teleop  sent:157  hands L:✓ R:~  body:✓ legs:–        <- sender
+Robot ghost :9907  robot:h1 joints:33 30/s drop:2  mode:Superimposed
+● REC 142f                                                <- only while recording
+```
+
+Sender line: `✓` = tracked high-confidence, `~` = low confidence (the server
+HOLDs those frames), `–` = untracked; `legs` needs FullBody body tracking.
+Ghost line: applied joints, echo packets/s, cumulative `drop:` (seq gaps),
+the server-honored mode in `[brackets]`, and `STALE n.ns` when no echo arrived
+for >0.5 s. The red **● REC nf** shows the server-side raw recorder state
+(frame count rides in every echo packet).
+
+These OnGUI HUDs only render on the PC mirror view. For an **in-headset**
+panel, run **Tools ▸ Robot Teleop ▸ Add Floating HUD Panel** — a lazy-follow
+world-space canvas 0.9 m ahead showing both ends of the loop (send Hz, hand
+conf, body/legs, mode, echo Hz/drops/staleness, REC) plus the live
+index/middle pinch strengths for gesture debugging. Toggle via its `visible`
+checkbox.
+
+## Teleop modes (what the robot follows)
+
+The sender stamps every packet with a scope the server masks by (`mode` field;
+masked groups HOLD their last targets):
+
+| Mode | drives |
+|---|---|
+| `FullBody` (default) | fingers + arms/wrists + torso + head + legs |
+| `UpperBody` | fingers + arms/wrists + torso + head |
+| `HandsOnly` | finger curls only |
+
+Cycle with a **double MIDDLE-finger pinch** on either hand (shut → open →
+shut within 1.5 s), the component context menu ▸ Cycle Mode, or the Inspector.
+The index-finger double pinch is separate — that one toggles recording
+server-side. Raw recordings store the mode per frame, so offline retargets
+mask identically. The ghost HUD shows the mode the server actually honored.
 
 ## Robot ghost overlay (see the robot move on your own body)
 
 **Tools ▸ Robot Teleop ▸ Robot Overlay ▸ Build H1 Ghost** builds a physics-free,
 semi-transparent H1 from the staged URDF (`Robots/h1_description/`) and wires a
-`RobotOverlayDriver` to it. At runtime the teleop server echoes every computed
+`RobotOverlayDriver` to it. **Build GR-1 Ghost** (Fourier GR-1 T2, 44 actuated
++ 10 mimic) and **Build G1 Ghost** (Unitree G1 + Dex3 three-finger hands, 43
+actuated) do the same from their staged URDFs — build ONE ghost at a time
+(every driver binds :9907; the second logs a bind error) and start the
+matching server (**Start Teleop Server (Quest → H1 / GR-1 / G1)**).
+
+Both GR-1 and G1 add 7-DoF arms whose **wrist joints follow your measured
+hand orientation** (GR-1: wrist yaw/roll/pitch; G1: roll/pitch/yaw). GR-1
+additionally has 3 neck joints following your head (G1 and H1 have no neck).
+Torso yaw drives `torso_joint` (H1) or `waist_yaw_joint` (GR-1/G1). Dex3's
+left-hand finger joints are sign-mirrored from the right's — handled by the
+layout (`left_hand_sign`), not calibration. At runtime the teleop server echoes every computed
 joint-target vector back to this machine (`handtracking/target_echo.py`, UDP
 **:9907**, destination = wherever the xr_pose packets came from — loopback in
 editor Play, the headset's LAN IP standalone), and the driver FK-poses the
@@ -155,6 +221,39 @@ H1 has **no neck joints** — head motion drives only DevVLA's EgoCam view
 `auto_reach` (profile, default on) grows your arm-reach estimate to the
 maximum shoulder→wrist distance it observes, so a fully extended human arm
 maps to a fully extended robot arm without measuring yourself.
+
+## Recording for fine-tuning (collect once, retarget to many)
+
+The server records **raw human episodes** (`teleop_raw_v1`: the verbatim
+`xr_pose` packets + the mapped targets + the mapper state), not robot-specific
+joint logs — one take retargets offline to ANY robot. Flow:
+
+1. Start the server via the menu (it passes `--record-raw episodes`). The
+   recorder is ARMED, not recording.
+2. In VR: **double pinch** (thumb+index on both hands) to start — the red
+   **● REC nf** appears on the HUD. Double pinch again to stop.
+3. Offline, in `handtracking/`:
+
+```bash
+# retarget the raw episode to a robot (same-robot replays auto-verify bit-exact)
+uv run --no-project --with numpy python retarget_episode.py \
+    episodes/episode_000000 --robot h1        # or --robot gr1
+
+# QA gate (rejects short/frozen/spiky episodes before they hit training)
+uv run --no-project --with numpy python ../server/tools/episode_quality.py \
+    episodes/episode_000000/retarget_h1
+
+# GR00T-flavored LeRobot v2.1 dataset (absolute joint state/action)
+uv run --no-project --with numpy --with pyarrow python \
+    ../tools/convert_teleop_to_lerobot.py \
+    --src episodes --robot h1 --out /path/h1_teleop_v1
+```
+
+The converter emits real URDF joint names and the v2.1 layout GR00T consumes
+(`data/chunk-000/*.parquet` + `meta/`). Ego-view video is rendered by
+replaying `steps.jsonl` in the robot's DevVLA scene (frames/ next to
+steps.jsonl are picked up automatically on re-convert); without frames the
+dataset is state/action-only and the converter says so.
 
 ## Calibration
 

@@ -80,6 +80,12 @@ namespace VlaTeleop
             public double t;
             public string[] names;
             public float[] targets;
+            // Raw-episode recorder state (server-side RawDemoRecorder, toggled
+            // by double pinch). Absent in old packets -> false/0 (JsonUtility).
+            public bool rec;
+            public int rec_frames;
+            // Teleop scope the mapper honored (full_body/upper_body/hands_only).
+            public string mode;
         }
 
         UdpClient _udp;
@@ -93,6 +99,24 @@ namespace VlaTeleop
         int _lastSeq = -1;
         int _appliedJoints;
         string _lastRobot = "";
+        bool _rec;
+        int _recFrames;
+        string _serverMode = "";
+        float _lastPacketAt = -1f;      // unscaledTime of last applied packet
+        int _drops;                     // cumulative seq gaps
+        int _rateCount; float _rateWindowStart; int _rate;   // pkts/s, 1 s bucket
+
+        // Read-only metrics for HUD panels (VlaTeleopHudPanel).
+        public bool HasEcho => _lastSeq >= 0;
+        public string Robot => _lastRobot;
+        public int AppliedJoints => _appliedJoints;
+        public int EchoRate => _rate;
+        public int Drops => _drops;
+        public bool Recording => _rec;
+        public int RecFrames => _recFrames;
+        public string ServerMode => _serverMode;
+        public float EchoAge => _lastPacketAt < 0f
+            ? float.PositiveInfinity : Time.unscaledTime - _lastPacketAt;
         bool _inFrontAnchored;
         Vector3 _inFrontPos;
         Quaternion _inFrontRot = Quaternion.identity;
@@ -182,10 +206,23 @@ namespace VlaTeleop
                 if (pkt != null && pkt.type == "joint_targets" && pkt.names != null)
                 {
                     _appliedJoints = ghost.SetTargets(pkt.names, pkt.targets);
+                    if (_lastSeq >= 0 && pkt.seq > _lastSeq + 1)
+                        _drops += pkt.seq - _lastSeq - 1;
                     _lastSeq = pkt.seq;
                     _lastRobot = pkt.robot;
+                    _rec = pkt.rec;
+                    _recFrames = pkt.rec_frames;
+                    _serverMode = pkt.mode ?? "";
+                    _lastPacketAt = Time.unscaledTime;
                     _beatPackets++;
+                    _rateCount++;
                 }
+            }
+            if (Time.unscaledTime - _rateWindowStart >= 1f)
+            {
+                _rate = _rateCount;
+                _rateCount = 0;
+                _rateWindowStart = Time.unscaledTime;
             }
             Heartbeat();
         }
@@ -264,7 +301,9 @@ namespace VlaTeleop
             Debug.Log($"[RobotOverlay] hb pkts:{_beatPackets} " +
                       $"({_beatPackets / heartbeatSeconds:0.0}/s) robot:{_lastRobot} " +
                       $"seq:{_lastSeq} joints:{_appliedJoints}/{ghost.joints.Length} " +
-                      $"mode:{mode} anchor:{(_beatBodyAnchored > 0 ? "body" : "head")}" +
+                      $"drops:{_drops} mode:{mode} " +
+                      $"anchor:{(_beatBodyAnchored > 0 ? "body" : "head")}" +
+                      (_rec ? $" REC:{_recFrames}f" : "") +
                       (_beatPackets == 0 ? "  (no echo — server running with echo_targets on?)" : ""));
             _beatPackets = 0;
             _beatBodyAnchored = 0;
@@ -273,11 +312,35 @@ namespace VlaTeleop
         void OnGUI()
         {
             if (!showHud) return;
-            string state = _lastSeq >= 0
-                ? $"robot:{_lastRobot} seq:{_lastSeq} joints:{_appliedJoints}"
-                : "waiting for joint_targets echo";
-            GUI.Label(new Rect(10, 34, 640, 22),
+            string state;
+            if (_lastSeq < 0)
+            {
+                state = "waiting for joint_targets echo";
+            }
+            else
+            {
+                float age = Time.unscaledTime - _lastPacketAt;
+                state = $"robot:{_lastRobot} joints:{_appliedJoints} {_rate}/s"
+                        + (_drops > 0 ? $" drop:{_drops}" : "")
+                        + (_serverMode.Length > 0 ? $" [{_serverMode}]" : "")
+                        + (age > 0.5f ? $"  STALE {age:0.0}s" : "");
+            }
+            GUI.Label(new Rect(10, 34, 760, 22),
                       $"Robot ghost :{listenPort}  {state}  mode:{mode}");
+
+            // REC indicator — big and red; the person in VR needs to know the
+            // take is rolling (double pinch toggles it server-side).
+            if (_rec)
+            {
+                var style = new GUIStyle(GUI.skin.label)
+                {
+                    fontSize = 22, fontStyle = FontStyle.Bold
+                };
+                var prev = GUI.color;
+                GUI.color = Color.red;
+                GUI.Label(new Rect(10, 58, 400, 30), $"● REC {_recFrames}f", style);
+                GUI.color = prev;
+            }
         }
     }
 }

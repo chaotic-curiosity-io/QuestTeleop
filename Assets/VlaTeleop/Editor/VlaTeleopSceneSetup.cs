@@ -56,6 +56,12 @@ namespace VlaTeleop.EditorTools
                 anchors.trackingSpace = rig.trackingSpace;
             }
             sender.bodyAnchors = anchors;
+
+            // The ghost overlay (if built) anchors to the same body data.
+            var overlay = Object.FindObjectOfType<RobotOverlayDriver>();
+            if (overlay != null && overlay.bodyAnchors == null)
+                overlay.bodyAnchors = anchors;
+
             EnableBodyTracking();
 
             EditorSceneManager.MarkSceneDirty(EditorSceneManager.GetActiveScene());
@@ -78,6 +84,25 @@ namespace VlaTeleop.EditorTools
                 "features + body tracking in the Meta Quest Link app, or build to device).");
         }
 
+        /// <summary>In-VR metrics panel — the OnGUI HUDs only show on the PC
+        /// mirror view; this one floats in front of you in the headset.</summary>
+        [MenuItem("Tools/Robot Teleop/Add Floating HUD Panel", priority = 2)]
+        public static void AddHudPanel()
+        {
+            var panel = Object.FindObjectOfType<VlaTeleopHudPanel>();
+            if (panel == null)
+            {
+                GameObject teleop = GetOrCreate("RobotTeleop");
+                panel = Undo.AddComponent<VlaTeleopHudPanel>(teleop);
+            }
+            panel.sender = Object.FindObjectOfType<VlaTeleopSender>();
+            panel.overlay = Object.FindObjectOfType<RobotOverlayDriver>();
+            EditorSceneManager.MarkSceneDirty(EditorSceneManager.GetActiveScene());
+            Selection.activeGameObject = panel.gameObject;
+            Debug.Log("[VlaTeleop] Floating HUD panel added (lazy-follow, "
+                      + "0.9 m ahead). Toggle via its 'visible' checkbox.");
+        }
+
         [MenuItem("Tools/Robot Teleop/Open README", priority = 20)]
         public static void OpenReadme()
         {
@@ -87,28 +112,73 @@ namespace VlaTeleop.EditorTools
             else Debug.LogWarning($"[VlaTeleop] README not found at {path}");
         }
 
-        /// <summary>Body tracking needs OVRManager consent: the on-startup
-        /// permission request (device builds) — set via SerializedObject since
-        /// the field is internal. Over Link, enable "Developer runtime
-        /// features" + body tracking in the Meta Quest Link PC app.</summary>
-        static void EnableBodyTracking()
+        /// <summary>Body tracking needs FOUR switches; this flips them all:
+        /// 1. OVRProjectConfig.bodyTrackingSupport (build capability),
+        /// 2. the BODY_TRACKING permission + feature in the custom
+        ///    AndroidManifest (kept in sync here since the project overrides
+        ///    the generated manifest),
+        /// 3. OVRManager.requestBodyTrackingPermissionOnStartup (runtime
+        ///    consent prompt — internal field, hence SerializedObject),
+        /// 4. FullBody joint set (OVRRuntimeSettings — verified, warns if not).
+        /// Over Link, ALSO enable "Developer runtime features" + body tracking
+        /// in the Meta Quest Link PC app.</summary>
+        [MenuItem("Tools/Robot Teleop/Enable Body Tracking (Project + Scene)", priority = 1)]
+        public static void EnableBodyTracking()
         {
+            // 1. Build capability.
+            var cfg = OVRProjectConfig.CachedProjectConfig;
+            if (cfg != null && cfg.bodyTrackingSupport == OVRProjectConfig.FeatureSupport.None)
+            {
+                cfg.bodyTrackingSupport = OVRProjectConfig.FeatureSupport.Supported;
+                OVRProjectConfig.CommitProjectConfig(cfg);
+                Debug.Log("[VlaTeleop] OVRProjectConfig: bodyTrackingSupport -> Supported.");
+            }
+
+            // 2. Custom AndroidManifest permission (project overrides the
+            //    generated manifest, so the entry must exist there).
+            const string manifestPath = "Assets/Plugins/Android/AndroidManifest.xml";
+            if (System.IO.File.Exists(manifestPath))
+            {
+                string xml = System.IO.File.ReadAllText(manifestPath);
+                if (!xml.Contains("com.oculus.permission.BODY_TRACKING"))
+                {
+                    xml = xml.Replace("</manifest>",
+                        "  <uses-permission android:name=\"com.oculus.permission.BODY_TRACKING\" />\n"
+                        + "  <uses-feature android:name=\"com.oculus.software.body_tracking\" "
+                        + "android:required=\"false\" />\n</manifest>");
+                    System.IO.File.WriteAllText(manifestPath, xml);
+                    AssetDatabase.ImportAsset(manifestPath);
+                    Debug.Log("[VlaTeleop] AndroidManifest: BODY_TRACKING permission added.");
+                }
+            }
+
+            // 3. Startup consent prompt on the scene's OVRManager.
             var mgr = Object.FindObjectOfType<OVRManager>();
             if (mgr == null)
             {
                 Debug.LogWarning("[VlaTeleop] No OVRManager in scene — body tracking "
                                  + "permission not configured.");
-                return;
             }
-            var so = new SerializedObject(mgr);
-            var prop = so.FindProperty("requestBodyTrackingPermissionOnStartup");
-            if (prop != null && !prop.boolValue)
+            else
             {
-                prop.boolValue = true;
-                so.ApplyModifiedProperties();
-                Debug.Log("[VlaTeleop] OVRManager: body-tracking permission request "
-                          + "on startup ENABLED.");
+                var so = new SerializedObject(mgr);
+                var prop = so.FindProperty("requestBodyTrackingPermissionOnStartup");
+                if (prop != null && !prop.boolValue)
+                {
+                    prop.boolValue = true;
+                    so.ApplyModifiedProperties();
+                    EditorSceneManager.MarkSceneDirty(mgr.gameObject.scene);
+                    Debug.Log("[VlaTeleop] OVRManager: body-tracking permission request "
+                              + "on startup ENABLED.");
+                }
             }
+
+            // 4. FullBody joint set — legs need it (QuestBodyAnchors.LegsValid).
+            var runtime = OVRRuntimeSettings.GetRuntimeSettings();
+            if (runtime != null && runtime.BodyTrackingJointSet != OVRPlugin.BodyJointSet.FullBody)
+                Debug.LogWarning("[VlaTeleop] OVRRuntimeSettings joint set is not FullBody — "
+                                 + "legs will not track. Set it in Project Settings ▸ "
+                                 + "Meta XR ▸ Body Tracking, or Movement SDK settings.");
         }
 
         // ---- helpers ------------------------------------------------------- //
