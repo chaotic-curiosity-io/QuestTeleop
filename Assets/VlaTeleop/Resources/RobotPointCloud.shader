@@ -41,6 +41,11 @@ Shader "VlaTeleop/RobotPointCloud"
             CGPROGRAM
             #pragma vertex vert
             #pragma fragment frag
+            // Single Pass Instanced stereo (OpenXR renderMode 1 = what this
+            // project ships). Without these the eye matrices never resolve and
+            // the cloud is invisible in the Game view / headset while still
+            // drawing fine in the mono Scene view.
+            #pragma multi_compile_instancing
             #include "UnityCG.cginc"
 
             sampler2D _DepthTex;
@@ -55,6 +60,7 @@ Shader "VlaTeleop/RobotPointCloud"
             {
                 float4 vertex : POSITION;      // unused (grid placeholder)
                 float2 uv : TEXCOORD0;         // normalized image coords, y DOWN from top
+                UNITY_VERTEX_INPUT_INSTANCE_ID
             };
 
             struct v2f
@@ -63,11 +69,14 @@ Shader "VlaTeleop/RobotPointCloud"
                 float2 cuv : TEXCOORD0;        // color-texture uv
                 float valid : TEXCOORD1;
                 float z : TEXCOORD2;
+                UNITY_VERTEX_OUTPUT_STEREO
             };
 
             v2f vert (appdata v)
             {
                 v2f o;
+                UNITY_SETUP_INSTANCE_ID(v);
+                UNITY_INITIALIZE_VERTEX_OUTPUT_STEREO(o);
                 // Depth texture rows are uploaded in wire order (row 0 = image
                 // top) so texture v == v.uv.y directly; the JPEG color texture
                 // decodes bottom-up, so its v is flipped.
@@ -106,6 +115,7 @@ Shader "VlaTeleop/RobotPointCloud"
 
             fixed4 frag (v2f i) : SV_Target
             {
+                UNITY_SETUP_STEREO_EYE_INDEX_POST_VERTEX(i);
                 if (i.valid < 0.999) discard;
                 if (_HasColor > 0.5)
                     return fixed4(tex2D(_ColorTex, i.cuv).rgb, 1);

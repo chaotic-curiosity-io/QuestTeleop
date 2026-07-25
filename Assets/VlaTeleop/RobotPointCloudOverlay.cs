@@ -315,6 +315,9 @@ namespace VlaTeleop
             {
                 if (_mat != null) DestroyImmediate(_mat);
                 _mat = new Material(shader);
+                // Single Pass Instanced stereo: keep the INSTANCING_ON variant
+                // live so the shader's per-eye matrices resolve in the headset.
+                _mat.enableInstancing = true;
                 _cloud.GetComponent<MeshRenderer>().sharedMaterial = _mat;
             }
             _mat.SetTexture("_DepthTex", _depthTex);
