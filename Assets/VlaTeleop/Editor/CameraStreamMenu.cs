@@ -51,6 +51,42 @@ namespace VlaTeleop.EditorTools
             Finish("[CameraStream] RobotCameraOverlay removed.");
         }
 
+        [MenuItem("Tools/Robot Teleop/Camera Stream/Enable Robot Point Cloud Overlay", priority = 62)]
+        public static void EnablePointCloud()
+        {
+            var existing = Object.FindObjectOfType<RobotPointCloudOverlay>(true);
+            if (existing != null)
+            {
+                existing.gameObject.SetActive(true);
+                existing.enabled = true;
+                EditorUtility.SetDirty(existing);
+                Selection.activeGameObject = existing.gameObject;
+                Finish($"[CameraStream] Re-enabled existing '{existing.name}'.");
+                return;
+            }
+            var go = new GameObject("RobotPointCloudOverlay");
+            Undo.RegisterCreatedObjectUndo(go, "Enable robot point cloud overlay");
+            go.AddComponent<RobotPointCloudOverlay>();
+            Selection.activeGameObject = go;
+            Finish("[CameraStream] RobotPointCloudOverlay added (udp :9909). DevVLA side: " +
+                   "VLA Control Panel > Teleop Mode > Enable Robot Depth Stream. With the H1 " +
+                   "ghost built, the cloud registers to the ghost; otherwise it parks in front " +
+                   "of you. Enable the Robot Camera Overlay too for RGB-colored points.");
+        }
+
+        [MenuItem("Tools/Robot Teleop/Camera Stream/Disable Robot Point Cloud Overlay", priority = 63)]
+        public static void DisablePointCloud()
+        {
+            var overlay = Object.FindObjectOfType<RobotPointCloudOverlay>(true);
+            if (overlay == null)
+            {
+                Debug.Log("[CameraStream] No RobotPointCloudOverlay in the open scene.");
+                return;
+            }
+            Undo.DestroyObjectImmediate(overlay.gameObject);
+            Finish("[CameraStream] RobotPointCloudOverlay removed.");
+        }
+
         static void Finish(string msg)
         {
             EditorSceneManager.MarkSceneDirty(EditorSceneManager.GetActiveScene());

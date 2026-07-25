@@ -65,6 +65,13 @@ namespace VlaTeleop
         int _rateCount; float _rateWindowStart; int _rate;   // frames/s, 1 s bucket
         float _nextBeat; int _beatFrames;
 
+        /// <summary>Latest decoded video frame (null until one arrives).
+        /// RobotPointCloudOverlay samples this to color the point cloud.</summary>
+        public Texture2D LatestTexture => _haveSeq ? _tex : null;
+
+        /// <summary>Sequence of the latest decoded frame.</summary>
+        public uint LastSeq => _lastSeq;
+
         void Start()
         {
             if (headTransform == null)
