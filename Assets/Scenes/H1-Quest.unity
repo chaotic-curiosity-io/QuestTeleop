@@ -13674,8 +13674,11 @@ MonoBehaviour:
   headTransform: {fileID: 1848740388}
   bodyAnchors: {fileID: 2058188233}
   trackingSpace: {fileID: 131451331}
+  followPlayer: 0
   positionLerp: 8
   rotationLerp: 6
+  detachDuringPlayback: 1
+  sender: {fileID: 1559240917}
   showHud: 1
   heartbeatSeconds: 5
 --- !u!114 &1380221054
@@ -15640,6 +15643,7 @@ GameObject:
   - component: {fileID: 1559240917}
   - component: {fileID: 1559240916}
   - component: {fileID: 1559240915}
+  - component: {fileID: 1559240919}
   m_Layer: 0
   m_Name: RobotTeleop
   m_TagString: Untagged
@@ -15661,6 +15665,7 @@ MonoBehaviour:
   m_EditorClassIdentifier: Assembly-CSharp::VlaTeleop.VlaTeleopHudPanel
   sender: {fileID: 1559240917}
   overlay: {fileID: 1380221053}
+  gestures: {fileID: 1559240919}
   headTransform: {fileID: 0}
   visible: 1
   distance: 0.9
@@ -15721,6 +15726,7 @@ MonoBehaviour:
   - 127.0.0.1:9906
   sendHz: 30
   mode: 0
+  commandRetrySeconds: 1.5
   showHud: 1
   bodyAnchors: {fileID: 2058188233}
   heartbeatSeconds: 5
@@ -15739,6 +15745,68 @@ Transform:
   m_Children: []
   m_Father: {fileID: 0}
   m_LocalEulerAnglesHint: {x: 0, y: 0, z: 0}
+--- !u!114 &1559240919
+MonoBehaviour:
+  m_ObjectHideFlags: 0
+  m_CorrespondingSourceObject: {fileID: 0}
+  m_PrefabInstance: {fileID: 0}
+  m_PrefabAsset: {fileID: 0}
+  m_GameObject: {fileID: 1559240914}
+  m_Enabled: 1
+  m_EditorHideFlags: 0
+  m_Script: {fileID: 11500000, guid: 3aab10653f3693b47832f2eff11792d3, type: 3}
+  m_Name: 
+  m_EditorClassIdentifier: Assembly-CSharp::VlaTeleop.TeleopGestureCommands
+  sender: {fileID: 1559240917}
+  leftHand: {fileID: 0}
+  rightHand: {fileID: 0}
+  leftSkeleton: {fileID: 0}
+  rightSkeleton: {fileID: 0}
+  headTransform: {fileID: 0}
+  bindings:
+  - enabled: 1
+    label: REC
+    command: 1
+    hand: 2
+    shapeState: {fileID: 0}
+    fallbackShape: 1
+    orientation: 1
+    holdSeconds: 0.45
+    arg: 0
+  - enabled: 1
+    label: PAUSE
+    command: 2
+    hand: 1
+    shapeState: {fileID: 0}
+    fallbackShape: 2
+    orientation: 3
+    holdSeconds: 0.5
+    arg: 0
+  - enabled: 1
+    label: SAVE
+    command: 5
+    hand: 2
+    shapeState: {fileID: 0}
+    fallbackShape: 1
+    orientation: 2
+    holdSeconds: 0.6
+    arg: 0
+  - enabled: 1
+    label: PLAY
+    command: 8
+    hand: 0
+    shapeState: {fileID: 0}
+    fallbackShape: 3
+    orientation: 4
+    holdSeconds: 0.5
+    arg: 0
+  scrubEnabled: 1
+  scrubHand: 1
+  scrubArmSeconds: 0.5
+  scrubSpanMeters: 0.5
+  pinchOn: 0.85
+  pinchOff: 0.4
+  heartbeatSeconds: 5
 --- !u!1 &1562623037
 GameObject:
   m_ObjectHideFlags: 0

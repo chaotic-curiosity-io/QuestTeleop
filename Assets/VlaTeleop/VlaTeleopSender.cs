@@ -32,13 +32,21 @@
 //    "head_pos":[3],"head_quat":[4],
 //    "left":{"visible":b,"conf":0..1,"wrist":[3],"wrist_quat":[4],"landmarks":[63]},
 //    "right":{...},
-//    "body":{"valid":b,"chest":[3],"l_shoulder":[3],"r_shoulder":[3]}}
+//    "body":{"valid":b,"chest":[3],"l_shoulder":[3],"r_shoulder":[3]},
+//    "cmd":{"id":N,"name":"rec_start","arg":0},
+//    "scrub":{"session":N,"active":b,"pos":0..1}}
 //
 // "conf" is OVRHand confidence (1 high, 0.5 low — low-confidence frames HOLD
 // on the Python side instead of chasing tracker noise). "body" carries the
 // body-tracked chest/shoulder anchors (QuestBodyAnchors) so the server can IK
 // from your MEASURED shoulders; when invalid the server falls back to the
 // virtual head-offset anchor. Run the server with --source quest-xr.
+//
+// "cmd" and "scrub" are the in-VR TRANSPORT: TeleopGestureCommands.cs turns
+// hand poses into record/pause/rewind/playback commands and this sender
+// carries them. A command REPEATS in every packet until the server echoes its
+// id back as session.ack (RobotOverlayDriver calls AcknowledgeCommand), so a
+// dropped datagram can't swallow a "stop recording".
 
 using System;
 using System.Collections.Generic;
@@ -79,10 +87,15 @@ namespace VlaTeleop
 
         [Header("Teleop mode")]
         [Tooltip("Which joint groups the server drives. Cycle in VR with a " +
-                 "double MIDDLE-finger pinch on either hand (index double " +
-                 "pinch is the server's record toggle), or via the component " +
-                 "context menu.")]
+                 "double MIDDLE-finger pinch on either hand, or via the " +
+                 "component context menu. (Recording is a separate control — " +
+                 "see TeleopGestureCommands.)")]
         public TeleopMode mode = TeleopMode.FullBody;
+
+        [Header("Transport (TeleopGestureCommands)")]
+        [Tooltip("Seconds to keep repeating an unacknowledged transport command " +
+                 "before giving up (no echo listener / server down).")]
+        public float commandRetrySeconds = 1.5f;
 
         [Header("Debug")]
         public bool showHud = true;
@@ -128,6 +141,28 @@ namespace VlaTeleop
             public float[] r_toe = new float[3];
         }
 
+        /// <summary>Transport command (record / pause / play / nudge). Repeated
+        /// in every packet until the server acks the id — UDP drops, and a lost
+        /// "stop recording" would be a lost take. id 0 = nothing pending.</summary>
+        [Serializable]
+        public class CmdPayload
+        {
+            public int id;
+            public string name = "";
+            public float arg;
+        }
+
+        /// <summary>Continuous timeline scrub. ``session`` increments per drag,
+        /// so the server can tell a fresh drag from a repeat of the release
+        /// that commits the previous one. session -1 = never scrubbed.</summary>
+        [Serializable]
+        public class ScrubPayload
+        {
+            public int session = -1;
+            public bool active;
+            public float pos;
+        }
+
         [Serializable]
         public class XrPosePacket
         {
@@ -141,6 +176,8 @@ namespace VlaTeleop
             public HandPayload left = new HandPayload();
             public HandPayload right = new HandPayload();
             public BodyPayload body = new BodyPayload();
+            public CmdPayload cmd = new CmdPayload();
+            public ScrubPayload scrub = new ScrubPayload();
         }
 
         static string ModeString(TeleopMode m) => m switch
@@ -258,6 +295,7 @@ namespace VlaTeleop
             FillHand(_packet.left, leftHand, leftSkeleton);
             FillHand(_packet.right, rightHand, rightSkeleton);
             FillBody(_packet.body);
+            ExpireCommand();      // AFTER the ack check, BEFORE serializing
 
             byte[] data = Encoding.UTF8.GetBytes(JsonUtility.ToJson(_packet));
             foreach (var ep in _targets)
@@ -281,8 +319,10 @@ namespace VlaTeleop
         }
 
         /// <summary>Double MIDDLE-finger pinch (shut → open → shut inside
-        /// 1.5 s) on either hand cycles the teleop mode. Index double pinch
-        /// is untouched — that one is the server's raw-recording toggle.</summary>
+        /// 1.5 s) on either hand cycles the teleop mode. The index finger is
+        /// left alone: an index pinch-and-hold is the transport's timeline
+        /// scrub, and a full-fist double pinch is the server's fallback
+        /// record toggle.</summary>
         void DetectModeGesture()
         {
             if (Time.unscaledTime < _modeDebounce) return;
@@ -314,6 +354,58 @@ namespace VlaTeleop
         {
             mode = (TeleopMode)(((int)mode + 1) % 3);
             Debug.Log($"[VlaTeleop] teleop mode -> {mode}");
+        }
+
+        // ---- transport commands (TeleopGestureCommands drives these) -------- //
+
+        int _cmdId;
+        float _cmdSentAt = -1f;
+        /// <summary>Last command id the server confirmed (echo `session.ack`).</summary>
+        public int AckedCommandId { get; private set; }
+        /// <summary>Command still awaiting an ack (empty when idle) — HUD.</summary>
+        public string PendingCommand =>
+            _packet.cmd.id > AckedCommandId ? _packet.cmd.name : "";
+
+        /// <summary>Queue a transport command for handtracking/session.py. It
+        /// rides in every packet until acked or <see cref="commandRetrySeconds"/>
+        /// elapses; the server keys de-duplication on the id, so repeats are
+        /// free.</summary>
+        public void SendCommand(string wireName, float arg = 0f)
+        {
+            if (string.IsNullOrEmpty(wireName)) return;
+            _packet.cmd.id = ++_cmdId;
+            _packet.cmd.name = wireName;
+            _packet.cmd.arg = arg;
+            _cmdSentAt = Time.unscaledTime;
+        }
+
+        /// <summary>Called by RobotOverlayDriver when the echo reports the
+        /// server's last executed command id.</summary>
+        public void AcknowledgeCommand(int ackId)
+        {
+            if (ackId > AckedCommandId) AckedCommandId = ackId;
+        }
+
+        /// <summary>Timeline scrub state (continuous; latest packet wins).</summary>
+        public void SetScrub(int session, bool active, float pos)
+        {
+            _packet.scrub.session = session;
+            _packet.scrub.active = active;
+            _packet.scrub.pos = Mathf.Clamp01(pos);
+        }
+
+        /// <summary>Stop repeating a command once it is acked, or after
+        /// commandRetrySeconds if nothing is listening (no echo receiver).</summary>
+        void ExpireCommand()
+        {
+            if (_packet.cmd.id == 0) return;
+            if (_packet.cmd.id <= AckedCommandId
+                || Time.unscaledTime - _cmdSentAt > commandRetrySeconds)
+            {
+                _packet.cmd.id = 0;
+                _packet.cmd.name = "";
+                _packet.cmd.arg = 0f;
+            }
         }
 
         void Heartbeat()
@@ -422,9 +514,12 @@ namespace VlaTeleop
                 ? (_packet.body.legs_valid ? "body:✓ legs:✓" : "body:✓ legs:–")
                 : "body:–";
             string err = _lastError != null ? $"  send:{_lastError}" : "";
+            string cmd = PendingCommand.Length > 0 ? $"  cmd:{PendingCommand}…" : "";
+            string scrub = _packet.scrub.active
+                ? $"  scrub:{_packet.scrub.pos:0.00}" : "";
             GUI.Label(new Rect(10, 10, 760, 22),
                       $"VLA teleop  sent:{_sent}  {hands}  {body}  " +
-                      $"mode:{mode}{err}");
+                      $"mode:{mode}{cmd}{scrub}{err}");
         }
 
         /// <summary>✓ high conf, ~ low conf (server HOLDs those frames), – untracked.</summary>

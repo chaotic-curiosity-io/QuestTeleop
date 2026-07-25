@@ -29,6 +29,9 @@ namespace VlaTeleop
         [Header("Sources (auto-found if left empty)")]
         public VlaTeleopSender sender;
         public RobotOverlayDriver overlay;
+        [Tooltip("Gesture transport — shows the pose being held and its dwell " +
+                 "progress, so a gesture that isn't registering is obvious.")]
+        public TeleopGestureCommands gestures;
         [Tooltip("Head pose source. Auto: OVRCameraRig.centerEyeAnchor, else Camera.main.")]
         public Transform headTransform;
 
@@ -52,6 +55,7 @@ namespace VlaTeleop
         {
             if (sender == null) sender = FindObjectOfType<VlaTeleopSender>();
             if (overlay == null) overlay = FindObjectOfType<RobotOverlayDriver>();
+            if (gestures == null) gestures = FindObjectOfType<TeleopGestureCommands>();
             var rig = FindObjectOfType<OVRCameraRig>();
             if (headTransform == null && rig != null) headTransform = rig.centerEyeAnchor;
             if (headTransform == null && Camera.main != null) headTransform = Camera.main.transform;
@@ -151,7 +155,7 @@ namespace VlaTeleop
                       .Append('/').Append(Pinch(sender.rightHand, OVRHand.HandFinger.Index))
                       .Append("  mid ").Append(Pinch(sender.leftHand, OVRHand.HandFinger.Middle))
                       .Append('/').Append(Pinch(sender.rightHand, OVRHand.HandFinger.Middle))
-                      .Append("   <i>2×idx=rec  2×mid=mode</i>\n");
+                      .Append("   <i>hold idx=scrub  2×mid=mode</i>\n");
                 }
             }
             sb.Append('\n');
@@ -175,11 +179,74 @@ namespace VlaTeleop
                     sb.Append("  <color=#ffcc66>STALE ")
                       .Append(overlay.EchoAge.ToString("0.0")).Append("s</color>");
                 sb.Append('\n');
-                if (overlay.Recording)
-                    sb.Append("<color=#ff4040><b>● REC ")
-                      .Append(overlay.RecFrames).Append("f</b></color>");
+                AppendTransport(sb);
             }
             return sb.ToString();
+        }
+
+        /// <summary>Transport block: state, timeline bar and the gesture being
+        /// held. This is the only feedback the operator gets that a pose was
+        /// recognized — without the dwell bar, a gesture that never fires is
+        /// indistinguishable from a server that never answered.</summary>
+        void AppendTransport(StringBuilder sb)
+        {
+            var s = overlay.Session;
+            string state = overlay.SessionState;
+            if (state.Length == 0)
+            {
+                if (overlay.Recording)
+                    sb.Append("<color=#ff4040><b>● REC ")
+                      .Append(overlay.RecFrames).Append("f</b></color>\n");
+            }
+            else
+            {
+                string color = state == "recording" ? "#ff4040"
+                             : state == "playback" ? "#66ccff"
+                             : state == "teleop" ? "#9fdfff" : "#ffcc55";
+                sb.Append("<color=").Append(color).Append("><b>")
+                  .Append(RobotOverlayDriver.Glyph(state)).Append(' ')
+                  .Append(state.ToUpperInvariant()).Append("</b></color>");
+                if (s.frames > 0)
+                    sb.Append("  ").Append(s.frames).Append("f  ")
+                      .Append(s.t.ToString("0.0")).Append('/')
+                      .Append(s.dur.ToString("0.0")).Append('s');
+                if (!string.IsNullOrEmpty(s.episode))
+                    sb.Append("  ").Append(s.episode);
+                sb.Append('\n');
+                if (s.dur > 0f) sb.Append(Bar(s.cursor, 34)).Append('\n');
+                if (!string.IsNullOrEmpty(s.msg))
+                    sb.Append("<i>").Append(s.msg).Append("</i>\n");
+            }
+
+            if (gestures == null) return;
+            var posing = gestures.Posing;
+            if (posing != null)
+            {
+                sb.Append("<color=#ffe680>pose ").Append(posing.label)
+                  .Append(' ').Append(Bar(posing.progress, 12))
+                  .Append("</color>\n");
+            }
+            else if (Time.unscaledTime - gestures.LastCommandAt < 1.5f)
+            {
+                sb.Append("<color=#7fff7f>✔ ").Append(gestures.LastCommandName)
+                  .Append("</color>\n");
+            }
+            if (gestures.ScrubActive)
+                sb.Append("<color=#ffcc55>◀◀ scrub ")
+                  .Append(gestures.ScrubPos.ToString("0.00"))
+                  .Append(" — release to splice</color>\n");
+            if (sender != null && sender.PendingCommand.Length > 0)
+                sb.Append("<i>sending ").Append(sender.PendingCommand)
+                  .Append("…</i>");
+        }
+
+        /// <summary>Text progress/timeline bar — the world-space canvas is a
+        /// plain UI.Text, so the bar is characters.</summary>
+        static string Bar(float f, int width)
+        {
+            int filled = Mathf.Clamp(Mathf.RoundToInt(f * width), 0, width);
+            return "[" + new string('=', filled)
+                       + new string('·', width - filled) + "]";
         }
 
         static string HandCell(VlaTeleopSender.HandPayload h)

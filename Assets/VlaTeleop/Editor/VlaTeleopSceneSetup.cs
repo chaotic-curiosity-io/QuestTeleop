@@ -8,6 +8,7 @@
 //
 // Menu (matches VitureUnity's menu path so the two apps read the same):
 //   Tools/Robot Teleop/Add VLA Teleop Sender   add + wire RobotTeleop onto the scene
+//   Tools/Robot Teleop/Gestures/…              in-VR transport (TeleopGestureSetup.cs)
 //   Tools/Robot Teleop/Open README             the VlaTeleop setup guide
 
 using System.Linq;
@@ -57,10 +58,14 @@ namespace VlaTeleop.EditorTools
             }
             sender.bodyAnchors = anchors;
 
-            // The ghost overlay (if built) anchors to the same body data.
+            // The ghost overlay (if built) anchors to the same body data, and
+            // acknowledges transport commands back to this sender.
             var overlay = Object.FindObjectOfType<RobotOverlayDriver>();
-            if (overlay != null && overlay.bodyAnchors == null)
-                overlay.bodyAnchors = anchors;
+            if (overlay != null)
+            {
+                if (overlay.bodyAnchors == null) overlay.bodyAnchors = anchors;
+                if (overlay.sender == null) overlay.sender = sender;
+            }
 
             EnableBodyTracking();
 

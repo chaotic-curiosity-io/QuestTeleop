@@ -13,12 +13,21 @@
 // (only the root anchor is smoothed).
 //
 // Anchor modes:
-//   Superimposed — the ghost stands where YOU stand: feet on the tracking-
+//   Superimposed — the ghost stands where YOU stood: feet on the tracking-
 //                  space floor, XZ under your chest (body-tracked) or head,
 //                  yaw from your measured shoulder line (head yaw fallback).
 //                  You look at it from inside; glance down at your arms, or
 //                  use InFront for a full view. Backface culling means the
 //                  torso shell mostly vanishes from inside.
+//                  The anchor is captured ONCE (and on Recenter), because the
+//                  robot it mirrors is bolted down: DevVLA's pelvis is
+//                  Immovable and its body yaw arrives as a waist JOINT target
+//                  in the echo. Re-solving the root from your live shoulder
+//                  line each frame added your yaw a SECOND time — the ghost
+//                  turned at 2x your rate, and the point cloud parented to
+//                  this root (RobotPointCloudOverlay) at 3x, since the VLAD
+//                  camera pose is already expressed in robot-base frame.
+//                  Set followPlayer to restore the old chase behaviour.
 //   InFront      — the ghost is parked inFrontDistance ahead of where you
 //                  stood when the mode engaged, turned to face you (a demo
 //                  stand, not a mirror: your left arm drives ITS left arm).
@@ -62,9 +71,22 @@ namespace VlaTeleop
         [Tooltip("Floor reference (OVRCameraRig.trackingSpace). Its world Y is " +
                  "the floor the ghost stands on; empty = world Y 0.")]
         public Transform trackingSpace;
+        [Tooltip("Superimposed: keep re-solving the ghost root from your LIVE pose " +
+                 "(legacy chase). Leave OFF — the robot this mirrors has an immovable " +
+                 "base and receives your body yaw as a waist joint target, so tracking " +
+                 "you here applies that yaw twice (3x for the ghost-parented point cloud).")]
+        public bool followPlayer = false;
         [Tooltip("Root anchor smoothing rates (1/s). Joint angles are NOT smoothed.")]
         public float positionLerp = 8f;
         public float rotationLerp = 6f;
+        [Tooltip("While the server plays a take back, park the ghost in front of " +
+                 "you instead of on you — you stepped out of the robot, so the " +
+                 "robot steps out of you. Restores your mode when playback ends.")]
+        public bool detachDuringPlayback = true;
+
+        [Header("Transport")]
+        [Tooltip("Sender to acknowledge transport commands to. Auto-found.")]
+        public VlaTeleopSender sender;
 
         [Header("Debug")]
         public bool showHud = true;
@@ -80,12 +102,30 @@ namespace VlaTeleop
             public double t;
             public string[] names;
             public float[] targets;
-            // Raw-episode recorder state (server-side RawDemoRecorder, toggled
-            // by double pinch). Absent in old packets -> false/0 (JsonUtility).
+            // Raw-episode recorder state (server-side RawDemoRecorder, driven
+            // by gestures). Absent in old packets -> false/0 (JsonUtility).
             public bool rec;
             public int rec_frames;
             // Teleop scope the mapper honored (full_body/upper_body/hands_only).
             public string mode;
+            // Transport state (handtracking/session.py). Absent in old packets
+            // -> a default-constructed block with an empty state string.
+            public SessionBlock session;
+        }
+
+        /// <summary>The take's transport state, as the server sees it — the
+        /// only view the person in VR gets of what the recorder is doing.</summary>
+        [Serializable]
+        public class SessionBlock
+        {
+            public string state;      // teleop|recording|paused|scrub|blending|playback
+            public string episode;    // episode_000003
+            public int frames;
+            public float t;           // playhead / recorded seconds
+            public float dur;         // take length
+            public float cursor;      // t/dur, 0..1
+            public int ack;           // last transport command the server ran
+            public string msg;        // human-readable status
         }
 
         UdpClient _udp;
@@ -102,6 +142,9 @@ namespace VlaTeleop
         bool _rec;
         int _recFrames;
         string _serverMode = "";
+        SessionBlock _session = new SessionBlock { state = "" };
+        bool _detached;                 // auto-switched to InFront for playback
+        AnchorMode _modeBeforePlayback;
         float _lastPacketAt = -1f;      // unscaledTime of last applied packet
         int _drops;                     // cumulative seq gaps
         int _rateCount; float _rateWindowStart; int _rate;   // pkts/s, 1 s bucket
@@ -115,9 +158,17 @@ namespace VlaTeleop
         public bool Recording => _rec;
         public int RecFrames => _recFrames;
         public string ServerMode => _serverMode;
+        /// <summary>Transport state from the server (never null once an echo
+        /// has arrived; ``state`` is empty for pre-transport servers).</summary>
+        public SessionBlock Session => _session;
+        public string SessionState => _session != null && _session.state != null
+            ? _session.state : "";
         public float EchoAge => _lastPacketAt < 0f
             ? float.PositiveInfinity : Time.unscaledTime - _lastPacketAt;
         bool _inFrontAnchored;
+        bool _superAnchored;            // Superimposed root solved and held
+        Vector3 _superPos;
+        Quaternion _superRot = Quaternion.identity;
         Vector3 _inFrontPos;
         Quaternion _inFrontRot = Quaternion.identity;
         Vector3 _lastForward = Vector3.forward;
@@ -213,6 +264,15 @@ namespace VlaTeleop
                     _rec = pkt.rec;
                     _recFrames = pkt.rec_frames;
                     _serverMode = pkt.mode ?? "";
+                    if (pkt.session != null && !string.IsNullOrEmpty(pkt.session.state))
+                    {
+                        _session = pkt.session;
+                        // Tell the sender its transport command landed so it
+                        // stops repeating it.
+                        if (sender == null) sender = FindObjectOfType<VlaTeleopSender>();
+                        if (sender != null) sender.AcknowledgeCommand(_session.ack);
+                        UpdatePlaybackDetach();
+                    }
                     _lastPacketAt = Time.unscaledTime;
                     _beatPackets++;
                     _rateCount++;
@@ -227,7 +287,12 @@ namespace VlaTeleop
             Heartbeat();
         }
 
-        void LateUpdate()
+        void LateUpdate() => StepAnchor(Time.deltaTime);
+
+        /// <summary>Move the ghost root toward its anchor pose. LateUpdate calls
+        /// this each frame; edit-mode harnesses (VLATeleopAnchorHeadlessTest)
+        /// call it directly since LateUpdate never fires outside Play mode.</summary>
+        public void StepAnchor(float dt)
         {
             if (ghost == null || headTransform == null) return;
             float floorY = trackingSpace != null ? trackingSpace.position.y : 0f;
@@ -249,28 +314,39 @@ namespace VlaTeleop
             }
             else
             {
-                bool body = bodyAnchors != null && bodyAnchors.IsValid;
-                Vector3 refPos = body ? bodyAnchors.Chest : headTransform.position;
-                Vector3 fwd;
-                if (body)
+                // The ghost stands in for a robot with an IMMOVABLE base, so the
+                // root is solved from your pose ONCE and then held; your body yaw
+                // reaches the ghost as the waist joint target in the echo. Solving
+                // it every frame (followPlayer) adds that yaw a second time.
+                if (!_superAnchored || followPlayer)
                 {
-                    Vector3 right = bodyAnchors.RightShoulder - bodyAnchors.LeftShoulder;
-                    right.y = 0f;
-                    fwd = right.sqrMagnitude > 1e-6f
-                        ? Vector3.Cross(right, Vector3.up).normalized
-                        : HorizontalForward();
-                    _beatBodyAnchored++;
+                    bool body = bodyAnchors != null && bodyAnchors.IsValid;
+                    Vector3 refPos = body ? bodyAnchors.Chest : headTransform.position;
+                    Vector3 fwd;
+                    if (body)
+                    {
+                        Vector3 right = bodyAnchors.RightShoulder - bodyAnchors.LeftShoulder;
+                        right.y = 0f;
+                        fwd = right.sqrMagnitude > 1e-6f
+                            ? Vector3.Cross(right, Vector3.up).normalized
+                            : HorizontalForward();
+                        _beatBodyAnchored++;
+                    }
+                    else
+                    {
+                        fwd = HorizontalForward();
+                    }
+                    _superPos = new Vector3(refPos.x, floorY + ghost.feetToPelvis, refPos.z);
+                    _superRot = Quaternion.LookRotation(fwd);
+                    // Hold from here on unless the body anchor was still warming
+                    // up (head fallback) — then re-solve until real tracking lands.
+                    _superAnchored = body || bodyAnchors == null;
                 }
-                else
-                {
-                    fwd = HorizontalForward();
-                }
-                targetPos = new Vector3(refPos.x, floorY + ghost.feetToPelvis, refPos.z);
-                targetRot = Quaternion.LookRotation(fwd);
+                targetPos = _superPos;
+                targetRot = _superRot;
                 _inFrontAnchored = false;          // re-anchor next InFront switch
             }
 
-            float dt = Time.deltaTime;
             ghost.transform.position = Vector3.Lerp(
                 ghost.transform.position, targetPos, 1f - Mathf.Exp(-positionLerp * dt));
             ghost.transform.rotation = Quaternion.Slerp(
@@ -287,11 +363,38 @@ namespace VlaTeleop
             return fwd;
         }
 
-        /// <summary>InFront mode: re-anchor at the player's current pose.</summary>
+        /// <summary>Re-anchor at the player's current pose (both modes): the
+        /// ghost is planted where you stand now, then holds again.</summary>
         [ContextMenu("Recenter")]
         public void Recenter()
         {
             _inFrontAnchored = false;
+            _superAnchored = false;
+        }
+
+        /// <summary>"Step out of the robot": while the server is playing a take
+        /// back, the ghost leaves your body and stands in front of you, so you
+        /// watch the demo instead of wearing it. Restores your anchor mode when
+        /// playback ends.</summary>
+        void UpdatePlaybackDetach()
+        {
+            if (!detachDuringPlayback) return;
+            bool playing = _session.state == "playback";
+            if (playing && !_detached)
+            {
+                _modeBeforePlayback = mode;
+                mode = AnchorMode.InFront;
+                _inFrontAnchored = false;          // park it where you stand now
+                _detached = true;
+                Debug.Log("[RobotOverlay] playback — ghost stepped out in front " +
+                          $"({_session.episode}, {_session.frames}f).");
+            }
+            else if (!playing && _detached)
+            {
+                mode = _modeBeforePlayback;
+                _detached = false;
+                Debug.Log("[RobotOverlay] playback ended — ghost back on you.");
+            }
         }
 
         void Heartbeat()
@@ -302,7 +405,7 @@ namespace VlaTeleop
                       $"({_beatPackets / heartbeatSeconds:0.0}/s) robot:{_lastRobot} " +
                       $"seq:{_lastSeq} joints:{_appliedJoints}/{ghost.joints.Length} " +
                       $"drops:{_drops} mode:{mode} " +
-                      $"anchor:{(_beatBodyAnchored > 0 ? "body" : "head")}" +
+                      $"anchor:{(_superAnchored && !followPlayer ? "held" : _beatBodyAnchored > 0 ? "body" : "head")}" +
                       (_rec ? $" REC:{_recFrames}f" : "") +
                       (_beatPackets == 0 ? "  (no echo — server running with echo_targets on?)" : ""));
             _beatPackets = 0;
@@ -328,9 +431,26 @@ namespace VlaTeleop
             GUI.Label(new Rect(10, 34, 760, 22),
                       $"Robot ghost :{listenPort}  {state}  mode:{mode}");
 
-            // REC indicator — big and red; the person in VR needs to know the
-            // take is rolling (double pinch toggles it server-side).
-            if (_rec)
+            // Transport indicator — the take's state has to be unmissable; the
+            // person in VR has no other way to know whether it is rolling.
+            string s = SessionState;
+            if (s.Length > 0 && s != "teleop")
+            {
+                var style = new GUIStyle(GUI.skin.label)
+                {
+                    fontSize = 22, fontStyle = FontStyle.Bold
+                };
+                var prev = GUI.color;
+                GUI.color = s == "recording" ? Color.red
+                          : s == "playback" ? new Color(0.4f, 0.8f, 1f)
+                          : new Color(1f, 0.8f, 0.3f);
+                GUI.Label(new Rect(10, 58, 600, 30),
+                          $"{Glyph(s)} {s.ToUpperInvariant()}  {_session.frames}f  " +
+                          $"{_session.t:0.0}/{_session.dur:0.0}s  {_session.msg}",
+                          style);
+                GUI.color = prev;
+            }
+            else if (_rec)   // pre-transport server: plain REC flag only
             {
                 var style = new GUIStyle(GUI.skin.label)
                 {
@@ -340,6 +460,21 @@ namespace VlaTeleop
                 GUI.color = Color.red;
                 GUI.Label(new Rect(10, 58, 400, 30), $"● REC {_recFrames}f", style);
                 GUI.color = prev;
+            }
+        }
+
+        /// <summary>Transport glyph per state — readable at a glance in the
+        /// headset without reading the word.</summary>
+        public static string Glyph(string sessionState)
+        {
+            switch (sessionState)
+            {
+                case "recording": return "●";
+                case "paused": return "❚❚";
+                case "scrub": return "◀◀";
+                case "blending": return "▸…";
+                case "playback": return "▶";
+                default: return "·";
             }
         }
     }

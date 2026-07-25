@@ -115,7 +115,9 @@ g1_dex3}` selects the embodiment.
 |---|---|
 | `QuestHandLandmarks.cs` | `OVRSkeleton` bones → MediaPipe 21-landmark order (metric world) + wrist rotation |
 | `QuestBodyAnchors.cs` | `OVRBody` → world chest + shoulder anchors (Movement-SDK body tracking) |
-| `VlaTeleopSender.cs` | head + hands + body → `xr_pose` UDP (:9905 server, :9906 DevVLA); 5 s heartbeat log |
+| `VlaTeleopSender.cs` | head + hands + body → `xr_pose` UDP (:9905 server, :9906 DevVLA); carries the `cmd`/`scrub` transport blocks; 5 s heartbeat log |
+| `TeleopGestureCommands.cs` | hand poses → transport commands (record/pause/rewind/playback); ISDK `ShapeRecognizerActiveState` when wired, built-in landmark tests otherwise; pinch-drag timeline scrub |
+| `Editor/TeleopGestureSetup.cs` | **Tools ▸ Robot Teleop ▸ Gestures** — add the transport, build/remove the ISDK pose recognizers |
 | `VlaTeleopGizmos.cs` | virtual torso + measured (magenta) shoulders + shoulder→wrist arm-target overlay |
 | `Editor/VlaTeleopSceneSetup.cs` | **Tools ▸ Robot Teleop** scene setup menu |
 | `Editor/TeleopServerMenu.cs` | **Tools ▸ Robot Teleop** start/stop the Python server, open logs |
@@ -132,22 +134,23 @@ g1_dex3}` selects the embodiment.
 ```
 VLA teleop  sent:157  hands L:✓ R:~  body:✓ legs:–        <- sender
 Robot ghost :9907  robot:h1 joints:33 30/s drop:2  mode:Superimposed
-● REC 142f                                                <- only while recording
+● RECORDING  142f  4.7/9.2s  recording                    <- transport state
 ```
 
 Sender line: `✓` = tracked high-confidence, `~` = low confidence (the server
 HOLDs those frames), `–` = untracked; `legs` needs FullBody body tracking.
 Ghost line: applied joints, echo packets/s, cumulative `drop:` (seq gaps),
 the server-honored mode in `[brackets]`, and `STALE n.ns` when no echo arrived
-for >0.5 s. The red **● REC nf** shows the server-side raw recorder state
-(frame count rides in every echo packet).
+for >0.5 s. The transport line is the session state from `session.py` —
+`● RECORDING` / `❚❚ PAUSED` / `◀◀ SCRUB` / `▶ PLAYBACK` with the frame count,
+playhead and take length (all of it rides in every echo packet).
 
 These OnGUI HUDs only render on the PC mirror view. For an **in-headset**
 panel, run **Tools ▸ Robot Teleop ▸ Add Floating HUD Panel** — a lazy-follow
 world-space canvas 0.9 m ahead showing both ends of the loop (send Hz, hand
-conf, body/legs, mode, echo Hz/drops/staleness, REC) plus the live
-index/middle pinch strengths for gesture debugging. Toggle via its `visible`
-checkbox.
+conf, body/legs, mode, echo Hz/drops/staleness), the transport state with a
+timeline bar, the dwell bar of whatever gesture you are currently holding, and
+the live index/middle pinch strengths. Toggle via its `visible` checkbox.
 
 ## Teleop modes (what the robot follows)
 
@@ -188,10 +191,18 @@ editor Play, the headset's LAN IP standalone), and the driver FK-poses the
 ghost with them. You see the ROBOT'S pose overlaid on your own movements —
 the retargeting offsets are visible by design; that's what the overlay is for.
 
-* **Superimposed** (default): the ghost stands where you stand — feet on the
+* **Superimposed** (default): the ghost stands where you stood — feet on the
   tracking floor, yaw from your measured shoulder line (head fallback). You
   view it from inside; glance down at your arms. Backface culling hides most
-  of the torso shell from within.
+  of the torso shell from within. The root is solved **once** (and on
+  Recenter), because the robot it mirrors has an immovable base and receives
+  your body yaw as a waist JOINT target in the echo — re-solving it every
+  frame applied your yaw a second time, so the ghost turned at 2× your rate
+  and the point cloud parented to this root at 3×. `followPlayer` restores the
+  old chase behaviour. Measured headless (2026-07-25, G1 + H1): ghost root yaw
+  gain 1.00 → 0.00, drift of a fixed point of the robot's world 2.369 m →
+  0.000 m; harness `Editor/VLATeleopAnchorHeadlessTest.cs`, artifacts in the
+  main repo's `media/2026-07-25_teleop-yaw-anchor-fix/`.
 * **InFront**: parked 1.5 m ahead, facing you — the calibration-check view
   (not a mirror: your left arm drives its left arm). Component context menu ▸
   **Recenter** re-anchors it.
@@ -222,6 +233,106 @@ H1 has **no neck joints** — head motion drives only DevVLA's EgoCam view
 maximum shoulder→wrist distance it observes, so a fully extended human arm
 maps to a fully extended robot arm without measuring yourself.
 
+## Transport controls: record, pause, rewind, play back — with your hands
+
+Both your hands are busy being the robot, so the record button has to *be* a
+hand. `TeleopGestureCommands.cs` recognizes deliberate poses and stamps a
+transport command into the outgoing `xr_pose` packet; `handtracking/session.py`
+runs the state machine and reports back over the joint-target echo, which is
+what the HUD's ● REC / timeline reads.
+
+| gesture | does |
+|---|---|
+| 👍 **thumbs up** (right) | start recording — and resume a paused take |
+| ✋ **open palm** (left, facing away) | pause: the robot **freezes** where it is |
+| 👎 **thumbs down** (right) | stop + save the episode |
+| ✌️ **peace sign** (either) | step out of the robot and play the take back (again = take control back) |
+| 🤏 **pinch + drag** (left index, hold 0.5 s) | scrub the timeline; release to **splice** |
+
+Each pose must be held ~0.5 s before it fires, and released before it can fire
+again — the HUD panel shows a dwell bar while you hold one, so a gesture that
+isn't registering looks different from a server that never answered.
+
+**Pause holds, it does not follow.** A paused robot stays exactly where it was.
+That's what makes rewind meaningful — the robot is a scrubbable playhead, not a
+mirror — and it means you can drop your arms without putting a lurch in the
+demo.
+
+**Resume ramps, and the ramp is not recorded.** Coming back from a pause your
+arms are somewhere else entirely. The robot interpolates from the held pose to
+your live pose over `resume_blend_s` (profile, default 1 s) and only *then*
+starts writing frames again, so the take is continuous even though you weren't.
+Paused time is excluded from the take's clock too (`t_rel` in each row), so a
+five-minute break doesn't become a five-minute freeze in the training data.
+
+**Rewind splices.** Pinch, hold, and drag your hand sideways: the robot rewinds
+*with* your hand, showing the frame under the cursor. Release and the frames
+after the cursor are dropped and the recording clock rewinds with them — so
+when you resume, you re-record over the bad span instead of appending after it.
+Every edit is logged in the episode's `meta.json` (`edits: [{op, t_rel,
+frame, dropped}]`), so a spliced demo stays auditable.
+
+**Playback drives the real robot.** Stepping out replays the take through the
+same `TeleopState` the mapper writes, so it reaches Unity over the WebSocket
+chunk stream that is already running: the DevVLA robot moves and the ghost
+moves, with no playback code on either Unity side. The ghost also **detaches**
+— during playback it parks in front of you instead of on you (`RobotOverlayDriver.
+detachDuringPlayback`), which is the whole point of stepping out.
+
+Setup: **Tools ▸ Robot Teleop ▸ Gestures ▸ Add Gesture Transport**, then
+optionally **Build Gesture Poses (ISDK)** — see the next section. Nothing needs
+`--record-raw` for playback of episodes already on disk; recording does.
+
+### Pose recognition (Interaction SDK)
+
+Shape recognition uses the Interaction SDK's pose system, the pattern in
+`Assets/Samples/Meta XR Interaction SDK/…/Example Scenes/PoseExamples.unity`:
+
+```
+Hand (IHand)
+  └─ FingerFeatureStateProvider          per-finger curl/flexion state machine
+       └─ ShapeRecognizerActiveState     live hand vs. one or more…
+            └─ ShapeRecognizer (.asset)  ThumbUp, FingersAllOpen, FingersScissors…
+```
+
+PoseExamples feeds the resulting `IActiveState` into an `ActiveStateSelector` →
+`SelectorUnityEventWrapper` → UnityEvents. We read the same bool one step
+earlier and add a dwell timer plus a world-orientation test. Reading it
+ourselves is what lets one shape mean two things: **thumbs up and thumbs down
+are the same `ShapeRecognizer`** — only the thumb's world direction differs.
+
+**Tools ▸ Robot Teleop ▸ Gestures ▸ Build Gesture Poses (ISDK)** builds that
+hierarchy under a `TeleopGesturePoses` object and assigns each recognizer to
+its binding (adding a `FingerFeatureStateProvider` with the SDK's own default
+thresholds if the rig lacks one). **Remove Gesture Poses** tears it back down.
+
+> **Two things are both called "hand tracking".** These scenes use the
+> Building Blocks **Hand Tracking** block — category *Core* — which adds
+> `OVRHand` + `OVRSkeleton`. That is exactly what the teleop stream and the
+> built-in poses read, and it is why hand tracking visibly works. It does
+> **not** add `Oculus.Interaction.Input.Hand`, which is a different component
+> that only the SDK's pose recognizers need. The block that used to bridge
+> them ("Hand Interactions") is tagged Hidden + Deprecated, so you will not
+> find it in the Building Blocks window. The supported route is the Quick
+> Actions wizard **GameObject ▸ Interaction SDK ▸ Add OVR Comprehensive
+> Interaction Rig** — the same rig `PoseExamples.unity` uses. Build Gesture
+> Poses offers to open it for you. None of this is required: the built-in
+> poses work with the `OVRHand` you already have.
+
+Orientation deliberately does *not* use `TransformRecognizerActiveState`: that
+needs an `IHmd` and a tracking-to-world transformer threaded through the rig,
+while `QuestHandLandmarks` already gives metric world joints that answer "is
+the thumb pointing up" exactly.
+
+Without the ISDK step everything still works — each binding carries a built-in
+finger test computed from those same landmarks (interior joint angles, the same
+idea as the Python finger retargeters). The SDK path is better (calibrated,
+hysteretic, inspector-editable), but a scene with nothing but an `OVRCameraRig`
+and hand tracking is not left without transport controls.
+
+Rebind anything in the `TeleopGestureCommands` inspector — the server only ever
+sees the command name.
+
 ## Recording for fine-tuning (collect once, retarget to many)
 
 The server records **raw human episodes** (`teleop_raw_v1`: the verbatim
@@ -230,8 +341,10 @@ joint logs — one take retargets offline to ANY robot. Flow:
 
 1. Start the server via the menu (it passes `--record-raw episodes`). The
    recorder is ARMED, not recording.
-2. In VR: **double pinch** (thumb+index on both hands) to start — the red
-   **● REC nf** appears on the HUD. Double pinch again to stop.
+2. In VR: **thumbs up** to start — the red **● RECORDING** line appears on the
+   HUD with the frame count and take length. Pause / rewind / save with the
+   gestures above. (A **double pinch** — full fist twice — still toggles
+   recording as the no-setup fallback.)
 3. Offline, in `handtracking/`:
 
 ```bash
@@ -260,18 +373,30 @@ dataset is state/action-only and the converter says so.
 All person/headset tunables live in `handtracking/profiles/quest_h1.json`
 (NOT Python source): finger open/closed-degree thresholds, thumb spread,
 `human_reach` (your shoulder→wrist, m), chest-anchor fallback offsets,
-smoothing. A finger that never fully opens/closes is a threshold retune in
+smoothing, and the transport knobs `resume_blend_s` / `playback_loop` /
+`playback_speed` / `gesture_transport` (set the last to `false` to ignore
+in-headset commands entirely). A finger that never fully opens/closes is a threshold retune in
 that file — watch the server heartbeat's curl values with an open hand vs a
 fist and adjust. Body tracking makes the chest offsets moot (measured
 shoulders win whenever valid). Verify body tracking itself with the Movement
 SDK sample scene `Assets/Samples/.../MovementBody.unity` — if the skeleton
 looks right there, the anchors feeding this sender are good.
 
-## Not compiled here
+## Compile status
 
-Per the openvla-unity-sim2real convention, this C# is written by careful API
-review against the Meta SDK types already used in `Assets/ReachyBridge/`
-(`OVRCameraRig`, `OVRHand`, `OVRSkeleton`) and has **not** been compiled in an
-editor. Verify the `OVRSkeleton.BoneId` names resolve on this project's Meta
-Core SDK version on first import (the thumb/pinky metacarpal ids are the ones
-most likely to differ across SDK versions).
+The transport scripts (`TeleopGestureCommands.cs`, `Editor/TeleopGestureSetup.cs`,
+and the sender / overlay-driver / HUD changes) **compile** — verified headlessly
+with the Unity CLI against a scratch project holding the three Meta packages,
+with a probe asserting the transport wire names, the default bindings, the
+session glyphs, the `cmd`/`scrub` packet JSON and the `session` echo block's
+`JsonUtility` round-trip.
+
+What is still unverified is *behavior in a headset*: gesture dwell times and
+the built-in pose thresholds (`Straightness` cut-offs, the 0.5 orientation
+dots) are first-guess numbers, and the ISDK recognizer path has never run
+against a real `OVRComprehensiveInteractionRig`. Expect a tuning pass on the
+first live session — the HUD's dwell bar is there to make that quick.
+
+Older scripts in this folder predate the CLI and were written by API review
+only; if `OVRSkeleton.BoneId` names ever drift across Meta Core SDK versions,
+the thumb/pinky metacarpal ids are the ones most likely to break.
