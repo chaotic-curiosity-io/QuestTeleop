@@ -105,6 +105,7 @@ namespace VlaTeleop.EditorTools
             // Every ShapeRecognizerActiveState needs a per-hand finger-state
             // provider. The Building Block hands ship an ISDK Hand but not
             // always the pose-detection providers, so make sure both exist.
+            if (!EnsureInteractionRig()) return;
             var left = FindHand(Handedness.Left);
             var right = FindHand(Handedness.Right);
             if (left == null && right == null)
@@ -121,56 +122,44 @@ namespace VlaTeleop.EditorTools
             }
 
             var providers = new Dictionary<Handedness, FingerFeatureStateProvider>();
-            if (left != null) providers[Handedness.Left] = EnsureProvider(left);
-            if (right != null) providers[Handedness.Right] = EnsureProvider(right);
+            var l = ExistingProvider(Handedness.Left);
+            var r = ExistingProvider(Handedness.Right);
+            if (l == null && left != null) l = EnsureProvider(left);
+            if (r == null && right != null) r = EnsureProvider(right);
+            if (l != null) providers[Handedness.Left] = l;
+            if (r != null) providers[Handedness.Right] = r;
 
-            // One recognizer object per (binding, hand). A binding set to
-            // "Either" hand would need two recognizers and only one slot, so
-            // those keep the built-in landmark test — it is hand-agnostic by
-            // construction and costs nothing.
+            // One recognizer object per (binding, hand). A ShapeRecognizer-
+            // ActiveState watches ONE hand, so Both/Either bindings get two —
+            // reusing a single recognizer for both sides would silently make
+            // "both hands" mean "whichever hand that recognizer watches".
             int wired = 0, skipped = 0;
             foreach (var b in g.bindings)
             {
                 if (b == null || !b.enabled) continue;
                 string[] shapes = ShapesFor(b.fallbackShape);
-                if (shapes == null)
-                {
-                    skipped++;
-                    continue;
-                }
-                if (b.hand == TeleopGestureCommands.HandSide.Either)
-                {
-                    skipped++;
-                    continue;
-                }
-                var h = b.hand == TeleopGestureCommands.HandSide.Left
-                    ? Handedness.Left : Handedness.Right;
-                if (!providers.TryGetValue(h, out var provider) || provider == null)
-                {
-                    skipped++;
-                    continue;
-                }
+                if (shapes == null) { skipped++; continue; }
                 var recognizers = LoadShapes(shapes);
-                if (recognizers == null)
+                if (recognizers == null) { skipped++; continue; }
+
+                bool needLeft = b.hand != TeleopGestureCommands.HandSide.Right;
+                bool needRight = b.hand != TeleopGestureCommands.HandSide.Left;
+                bool any = false;
+                if (needLeft)
                 {
-                    skipped++;
-                    continue;
+                    var s = BuildRecognizer(root, b, Handedness.Left, providers,
+                                            recognizers);
+                    b.shapeState = s;
+                    any |= s != null;
                 }
-                string name = $"{b.label}_{h}";
-                var go = FindChild(root.transform, name);
-                if (go == null)
+                if (needRight)
                 {
-                    go = new GameObject(name);
-                    Undo.RegisterCreatedObjectUndo(go, "Create " + name);
-                    go.transform.SetParent(root.transform, false);
+                    var s = BuildRecognizer(root, b, Handedness.Right, providers,
+                                            recognizers);
+                    b.shapeStateRight = s;
+                    any |= s != null;
                 }
-                var state = go.GetComponent<ShapeRecognizerActiveState>();
-                if (state == null)
-                    state = Undo.AddComponent<ShapeRecognizerActiveState>(go);
-                state.InjectAllShapeRecognizerActiveState(provider, recognizers);
-                EditorUtility.SetDirty(state);
-                b.shapeState = state;
-                wired++;
+                if (any) wired++; else skipped++;
             }
 
             EditorUtility.SetDirty(g);
@@ -203,12 +192,201 @@ namespace VlaTeleop.EditorTools
                       "fall back to the built-in landmark tests.");
         }
 
+        /// <summary>Create (or reuse) one ShapeRecognizerActiveState for a
+        /// binding on one hand. Returns null when that hand has no provider.</summary>
+        static ShapeRecognizerActiveState BuildRecognizer(
+            GameObject root, TeleopGestureCommands.Binding b, Handedness h,
+            Dictionary<Handedness, FingerFeatureStateProvider> providers,
+            ShapeRecognizer[] recognizers)
+        {
+            if (!providers.TryGetValue(h, out var provider) || provider == null)
+                return null;
+            string name = $"{b.label}_{h}";
+            var go = FindChild(root.transform, name);
+            if (go == null)
+            {
+                go = new GameObject(name);
+                Undo.RegisterCreatedObjectUndo(go, "Create " + name);
+                go.transform.SetParent(root.transform, false);
+            }
+            var state = go.GetComponent<ShapeRecognizerActiveState>();
+            if (state == null) state = Undo.AddComponent<ShapeRecognizerActiveState>(go);
+            state.InjectAllShapeRecognizerActiveState(provider, recognizers);
+            EditorUtility.SetDirty(state);
+            return state;
+        }
+
+        // ---- one-click setup -------------------------------------------------- //
+
+        const string H1Scene = "Assets/Scenes/H1-Quest.unity";
+
+        /// <summary>Everything in one go: Interaction SDK rig, gesture transport,
+        /// finger-state providers, pose recognizers, wiring. Safe to re-run.</summary>
+        [MenuItem("Tools/Robot Teleop/Gestures/Set Up ISDK Hand Poses (Active Scene)",
+                  priority = 1)]
+        public static void SetUpEverything()
+        {
+            if (Object.FindObjectOfType<OVRCameraRig>() == null)
+            {
+                EditorUtility.DisplayDialog(
+                    "No OVRCameraRig",
+                    "The active scene has no OVRCameraRig. Open a teleop scene " +
+                    "(Assets/Scenes/H1-Quest.unity) and run this again — or use " +
+                    "\"Set Up ISDK Hand Poses in H1-Quest\", which opens it for you.",
+                    "OK");
+                return;
+            }
+            if (!EnsureInteractionRig()) return;
+            var g = AddTransport();
+            if (g == null) return;
+            BuildPoses();
+
+            var scene = EditorSceneManager.GetActiveScene();
+            EditorSceneManager.MarkSceneDirty(scene);
+            Debug.Log("[VlaTeleop] ISDK gesture setup complete for scene " +
+                      $"'{scene.name}'. Save the scene to keep it.");
+        }
+
+        /// <summary>Reset the binding tables to the shipped defaults and re-wire
+        /// the ISDK recognizers to match.
+        ///
+        /// Needed whenever the defaults change in code: the scene's serialized
+        /// lists take precedence, so an existing component silently keeps the
+        /// bindings it was created with. Run this after pulling changes if a
+        /// gesture or key "should" work and doesn't.</summary>
+        [MenuItem("Tools/Robot Teleop/Gestures/Reset Bindings to Defaults", priority = 6)]
+        public static void ResetBindings()
+        {
+            var g = Object.FindObjectOfType<TeleopGestureCommands>();
+            if (g == null)
+            {
+                EditorUtility.DisplayDialog(
+                    "No gesture transport",
+                    "This scene has no TeleopGestureCommands. Run \"Set Up ISDK " +
+                    "Hand Poses (Active Scene)\" first.", "OK");
+                return;
+            }
+            Undo.RecordObject(g, "Reset gesture bindings");
+            g.RestoreDefaults();
+            EditorUtility.SetDirty(g);
+            BuildPoses();                       // re-point shapeState at the recognizers
+
+            var scene = EditorSceneManager.GetActiveScene();
+            EditorSceneManager.MarkSceneDirty(scene);
+            if (!string.IsNullOrEmpty(scene.path)) EditorSceneManager.SaveScene(scene);
+            Debug.Log($"[VlaTeleop] Bindings reset to defaults ({g.bindings.Count} " +
+                      $"poses, {g.keyboardShortcuts.Count} keys) and re-wired" +
+                      (string.IsNullOrEmpty(scene.path) ? "." : " — scene saved."));
+        }
+
+        /// <summary>Same, but opens H1-Quest first and SAVES it.</summary>
+        [MenuItem("Tools/Robot Teleop/Gestures/Set Up ISDK Hand Poses in H1-Quest",
+                  priority = 2)]
+        public static void SetUpH1QuestScene()
+        {
+            if (AssetDatabase.LoadAssetAtPath<SceneAsset>(H1Scene) == null)
+            {
+                EditorUtility.DisplayDialog("Scene not found",
+                                            $"{H1Scene} does not exist.", "OK");
+                return;
+            }
+            if (!EditorSceneManager.SaveCurrentModifiedScenesIfUserWantsTo()) return;
+
+            var scene = EditorSceneManager.OpenScene(H1Scene, OpenSceneMode.Single);
+            if (!EnsureInteractionRig()) return;
+            var g = AddTransport();
+            if (g == null) return;
+            BuildPoses();
+
+            EditorSceneManager.MarkSceneDirty(scene);
+            EditorSceneManager.SaveScene(scene);
+            Debug.Log($"[VlaTeleop] {H1Scene} updated and SAVED — Interaction SDK " +
+                      "rig + pose recognizers wired. Press Play (or rebuild) to try " +
+                      "the gestures.");
+        }
+
         // ---- the two different "hand tracking" ------------------------------- //
 
         /// <summary>Menu path of the Interaction SDK's rig wizard — the same rig
         /// PoseExamples.unity uses (prefab OVRComprehensiveInteractionRig).</summary>
         const string RigWizardMenu =
             "GameObject/Interaction SDK/Add OVR Comprehensive Interaction Rig";
+
+        /// <summary>The rig prefab the wizard instantiates. Referenced by GUID
+        /// because the wizard class itself is `internal` — we cannot call it,
+        /// but we can instantiate exactly what it would have.</summary>
+        const string RigPrefabGuid = "0a7d2469f24041c4284c66706f84c45e";
+        const string InteractionRigName = "OVRComprehensiveInteractionRig";
+
+        /// <summary>Add the Interaction SDK hand rig to the scene if it has
+        /// none, and return whether ISDK hands are present afterwards.
+        ///
+        /// The rig is a prefab under the OVRCameraRig; `OVRCameraRigRef` needs
+        /// an explicit reference to that rig (it asserts on it at Start), and
+        /// the Core hand-tracking block's own visuals are disabled so you don't
+        /// see two overlapping sets of hands — both things the wizard does.</summary>
+        public static bool EnsureInteractionRig()
+        {
+            if (FindHand(Handedness.Left) != null || FindHand(Handedness.Right) != null)
+                return true;
+
+            var camRig = Object.FindObjectOfType<OVRCameraRig>();
+            if (camRig == null)
+            {
+                Debug.LogError("[VlaTeleop] No OVRCameraRig in the scene — cannot add " +
+                               "the Interaction SDK rig. Open a teleop scene first.");
+                return false;
+            }
+
+            string path = AssetDatabase.GUIDToAssetPath(RigPrefabGuid);
+            var prefab = string.IsNullOrEmpty(path)
+                ? null : AssetDatabase.LoadAssetAtPath<GameObject>(path);
+            if (prefab == null)
+            {
+                Debug.LogError("[VlaTeleop] Could not find the " + InteractionRigName +
+                               " prefab (guid " + RigPrefabGuid + "). Add it by hand " +
+                               "via " + RigWizardMenu.Replace("/", " ▸ ") + ".");
+                return false;
+            }
+
+            var rig = (GameObject)PrefabUtility.InstantiatePrefab(prefab, camRig.transform);
+            rig.name = InteractionRigName;
+            rig.transform.localPosition = Vector3.zero;
+            rig.transform.localRotation = Quaternion.identity;
+            Undo.RegisterCreatedObjectUndo(rig, "Add " + InteractionRigName);
+
+            // OVRCameraRigRef._ovrCameraRig is a serialized field the component
+            // asserts on; the prefab ships it empty.
+            foreach (var reference in rig.GetComponentsInChildren<OVRCameraRigRef>(true))
+            {
+                var so = new SerializedObject(reference);
+                var prop = so.FindProperty("_ovrCameraRig");
+                if (prop != null && prop.objectReferenceValue == null)
+                {
+                    prop.objectReferenceValue = camRig;
+                    so.ApplyModifiedProperties();
+                }
+            }
+
+            // The Core "Hand Tracking" block renders hands too; leaving both on
+            // gives you a doubled, slightly offset pair.
+            int hidden = 0;
+            foreach (var h in camRig.GetComponentsInChildren<OVRHand>(true))
+            {
+                if (h.TryGetComponent<OVRSkeletonRenderer>(out var sk) && sk.enabled)
+                { sk.enabled = false; hidden++; }
+                if (h.TryGetComponent<OVRMeshRenderer>(out var mr) && mr.enabled)
+                { mr.enabled = false; hidden++; }
+            }
+
+            int hands = Object.FindObjectsOfType<Hand>(true).Length;
+            Debug.Log($"[VlaTeleop] Added {InteractionRigName} under " +
+                      $"'{camRig.name}' — {hands} Interaction SDK Hand component(s), " +
+                      $"{hidden} duplicate Core hand visual(s) disabled. The teleop " +
+                      "stream still reads the OVRHand/OVRSkeleton from the Core " +
+                      "block; only pose recognition uses these.");
+            return hands > 0;
+        }
 
         /// <summary>Explain the Core-vs-Interaction hand-tracking split, which
         /// is genuinely confusing: the Building Blocks window's **Hand
@@ -308,6 +486,41 @@ namespace VlaTeleop.EditorTools
         /// does not exist in edit mode — fall back to the GameObject name,
         /// which the SDK's own rigs spell out ("LeftHand" / "RightHand").
         /// </summary>
+        /// <summary>A finger-state provider the RIG already ships, for this
+        /// hand. Strongly preferred over adding our own: the comprehensive rig
+        /// contains many Hand components — synthetic (visual-only) hands among
+        /// them — and its own providers are already bound to the TRACKED hand.
+        /// Left to itself, FindHand can return a synthetic hand and we would
+        /// hang pose recognition off something that never sees your fingers.</summary>
+        static FingerFeatureStateProvider ExistingProvider(Handedness h)
+        {
+            foreach (var p in Object.FindObjectsOfType<FingerFeatureStateProvider>(true))
+            {
+                var so = new SerializedObject(p);
+                var handProp = so.FindProperty("_hand");
+                var hand = handProp?.objectReferenceValue as Component;
+                if (hand == null) continue;
+                var asHand = hand.GetComponent<Hand>() ?? hand as Hand;
+                Handedness found;
+                try { found = asHand != null ? asHand.Handedness : NameHandedness(hand.name); }
+                catch (System.Exception) { found = NameHandedness(hand.name); }
+                if (found != h) continue;
+                // Skip synthetic/visual hands — they replay a pose, they do not
+                // report your live finger curls.
+                if (IsSynthetic(p.gameObject) || IsSynthetic(hand.gameObject)) continue;
+                return p;
+            }
+            return null;
+        }
+
+        static bool IsSynthetic(GameObject go)
+        {
+            for (var t = go.transform; t != null; t = t.parent)
+                if (t.name.IndexOf("synthetic", System.StringComparison.OrdinalIgnoreCase) >= 0)
+                    return true;
+            return false;
+        }
+
         static Hand FindHand(Handedness h)
         {
             foreach (var hand in Object.FindObjectsOfType<Hand>(true))

@@ -392,18 +392,53 @@ namespace VlaTeleop
             _mesh.triangles = tris;
         }
 
+        /// <summary>Transform the cloud is currently registered to (ghost root or
+        /// a parked anchor). Read-only handle for headless tests.</summary>
+        public Transform Anchor => _anchor;
+
+        /// <summary>Whether the cloud is riding a ghost rather than a parked
+        /// anchor of its own.</summary>
+        public bool IsGhostAnchored => _anchor != null && !_ownAnchor;
+
+        RobotOverlayGhost _forcedGhost;
+
+        /// <summary>Temporarily register the cloud to a ghost, whatever ``mode``
+        /// says. Used during PLAYBACK: the robot walks out to a stand in front of
+        /// you, and the world it perceived has to walk out with it — otherwise
+        /// the cloud performs the take alone while the ghost stays behind, which
+        /// is exactly the split this overrides.</summary>
+        public void ForceGhostAnchor(RobotOverlayGhost g)
+        {
+            if (g == null) return;
+            _forcedGhost = g;
+            UpdateAnchor();
+        }
+
+        /// <summary>Drop the override and go back to whatever ``mode`` selects.
+        /// A previously parked anchor is rebuilt in front of the user.</summary>
+        public void RestoreAnchorMode()
+        {
+            if (_forcedGhost == null) return;
+            _forcedGhost = null;
+            if (_anchor != null && !_ownAnchor) _anchor = null;   // force a re-solve
+            UpdateAnchor();
+        }
+
         void UpdateAnchor()
         {
-            bool useGhost = mode == AnchorMode.GhostAnchored ||
+            var target = _forcedGhost != null ? _forcedGhost : ghost;
+            bool useGhost = _forcedGhost != null ||
+                            mode == AnchorMode.GhostAnchored ||
                             (mode == AnchorMode.Auto && ghost != null);
-            if (useGhost && ghost != null)
+            if (useGhost && target != null)
             {
-                if (_anchor != ghost.transform)
+                ghost = ghost != null ? ghost : target;
+                if (_anchor != target.transform)
                 {
-                    if (_ownAnchor && _anchor != null) Destroy(_anchor.gameObject);
+                    if (_ownAnchor && _anchor != null) DestroyAnchor(_anchor.gameObject);
                     _ownAnchor = false;
-                    _anchor = ghost.transform;
-                    _cloud.SetParent(_anchor, false);
+                    _anchor = target.transform;
+                    if (_cloud != null) _cloud.SetParent(_anchor, false);
                 }
                 return;
             }
@@ -413,8 +448,16 @@ namespace VlaTeleop
                 _anchor = go.transform;
                 _ownAnchor = true;
                 PlaceAnchorInFront();
-                _cloud.SetParent(_anchor, false);
+                if (_cloud != null) _cloud.SetParent(_anchor, false);
             }
+        }
+
+        /// <summary>Destroy that works in edit mode too (headless harnesses run
+        /// outside Play, where Destroy is deferred forever).</summary>
+        static void DestroyAnchor(GameObject go)
+        {
+            if (Application.isPlaying) Destroy(go);
+            else DestroyImmediate(go);
         }
 
         [ContextMenu("Recenter In Front")]

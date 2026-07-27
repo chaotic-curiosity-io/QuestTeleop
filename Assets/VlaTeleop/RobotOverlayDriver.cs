@@ -79,10 +79,21 @@ namespace VlaTeleop
         [Tooltip("Root anchor smoothing rates (1/s). Joint angles are NOT smoothed.")]
         public float positionLerp = 8f;
         public float rotationLerp = 6f;
-        [Tooltip("While the server plays a take back, park the ghost in front of " +
-                 "you instead of on you — you stepped out of the robot, so the " +
-                 "robot steps out of you. Restores your mode when playback ends.")]
+        [Tooltip("While the server plays a take back, walk the ghost out to a " +
+                 "stand in front of you instead of leaving it on you — you " +
+                 "stepped out of the robot, so the robot steps out of you. " +
+                 "Restores your mode when playback ends.")]
         public bool detachDuringPlayback = true;
+        [Tooltip("Playback: meters ahead of you the ghost stands. Further than " +
+                 "inFrontDistance because you are now watching a whole body " +
+                 "perform, not checking your own arm alignment.")]
+        public float playbackDistance = 2.2f;
+        [Tooltip("Point cloud to bring WITH the ghost during playback. Auto-found. " +
+                 "Without this the cloud performs the take parked where it was " +
+                 "while the ghost walks out — the two come apart.")]
+        public RobotPointCloudOverlay pointCloud;
+        [Tooltip("Camera panel to re-center on Recenter. Auto-found.")]
+        public RobotCameraOverlay cameraOverlay;
 
         [Header("Transport")]
         [Tooltip("Sender to acknowledge transport commands to. Auto-found.")]
@@ -303,8 +314,12 @@ namespace VlaTeleop
             {
                 if (!_inFrontAnchored)
                 {
+                    // Playback stands further back than a manual InFront check:
+                    // you are watching a whole body perform, not eyeballing your
+                    // own arm alignment.
+                    float dist = _detached ? playbackDistance : inFrontDistance;
                     Vector3 fwd = HorizontalForward();
-                    Vector3 at = headTransform.position + fwd * inFrontDistance;
+                    Vector3 at = headTransform.position + fwd * dist;
                     _inFrontPos = new Vector3(at.x, floorY + ghost.feetToPelvis, at.z);
                     _inFrontRot = Quaternion.LookRotation(-fwd);   // face the player
                     _inFrontAnchored = true;
@@ -370,6 +385,38 @@ namespace VlaTeleop
         {
             _inFrontAnchored = false;
             _superAnchored = false;
+            // Re-park everything else that hangs off the player, so one gesture
+            // fixes the whole overlay rather than just the ghost.
+            if (pointCloud == null) pointCloud = FindObjectOfType<RobotPointCloudOverlay>();
+            if (pointCloud != null) pointCloud.PlaceAnchorInFront();
+            if (cameraOverlay == null) cameraOverlay = FindObjectOfType<RobotCameraOverlay>();
+            if (cameraOverlay != null) cameraOverlay.Recenter();
+            Debug.Log("[RobotOverlay] recentered on the player.");
+        }
+
+        /// <summary>Headless / edit-mode entry: apply one joint_targets echo
+        /// exactly as the UDP path does, bypassing the socket. Used by
+        /// VLAPlaybackOverlayHeadlessTest, so the harness exercises the real
+        /// state transitions rather than a re-implementation of them.</summary>
+        public void ApplyEchoJson(string json)
+        {
+            TargetsPacket pkt = null;
+            try { pkt = JsonUtility.FromJson<TargetsPacket>(json); }
+            catch (Exception) { }
+            if (pkt == null || pkt.type != "joint_targets" || pkt.names == null) return;
+            if (ghost != null) _appliedJoints = ghost.SetTargets(pkt.names, pkt.targets);
+            _lastSeq = pkt.seq;
+            _lastRobot = pkt.robot;
+            _rec = pkt.rec;
+            _recFrames = pkt.rec_frames;
+            _serverMode = pkt.mode ?? "";
+            if (pkt.session != null && !string.IsNullOrEmpty(pkt.session.state))
+            {
+                _session = pkt.session;
+                if (sender != null) sender.AcknowledgeCommand(_session.ack);
+                UpdatePlaybackDetach();
+            }
+            _lastPacketAt = Time.unscaledTime;
         }
 
         /// <summary>"Step out of the robot": while the server is playing a take
@@ -386,13 +433,23 @@ namespace VlaTeleop
                 mode = AnchorMode.InFront;
                 _inFrontAnchored = false;          // park it where you stand now
                 _detached = true;
-                Debug.Log("[RobotOverlay] playback — ghost stepped out in front " +
-                          $"({_session.episode}, {_session.frames}f).");
+                // The cloud has to come WITH the robot. Left on its own parked
+                // anchor it would act out the take where it happens to be while
+                // the ghost walks out empty-handed — the robot and the world it
+                // perceived would be performing in two different places.
+                if (pointCloud == null) pointCloud = FindObjectOfType<RobotPointCloudOverlay>();
+                if (pointCloud != null && ghost != null) pointCloud.ForceGhostAnchor(ghost);
+                Debug.Log("[RobotOverlay] playback — ghost walking out to a stand " +
+                          $"{playbackDistance:0.0} m ahead ({_session.episode}, " +
+                          $"{_session.frames}f)" +
+                          (pointCloud != null ? " with its point cloud." : "."));
             }
             else if (!playing && _detached)
             {
                 mode = _modeBeforePlayback;
                 _detached = false;
+                _superAnchored = false;            // re-plant on you where you are NOW
+                if (pointCloud != null) pointCloud.RestoreAnchorMode();
                 Debug.Log("[RobotOverlay] playback ended — ghost back on you.");
             }
         }

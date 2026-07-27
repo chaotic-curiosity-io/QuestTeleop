@@ -34,8 +34,16 @@ namespace VlaTeleop
         public Transform headTransform;
         [Tooltip("Meters in front of the head.")]
         public float distance = 1.2f;
-        [Tooltip("Vertical offset from gaze center (negative = below eye line).")]
-        public float heightOffset = -0.15f;
+        [Tooltip("Vertical offset from gaze center. POSITIVE (above the eye " +
+                 "line) by default: the robot's point cloud materializes at " +
+                 "roughly body height straight ahead, so a panel sitting below " +
+                 "the gaze centre ends up inside it.")]
+        public float heightOffset = 0.28f;
+        [Tooltip("Draw the panel over everything (ZTest Always). Belt and " +
+                 "braces with heightOffset — the cloud is a volume, so no fixed " +
+                 "offset is safe at every distance, but a panel that ignores " +
+                 "depth can never be swallowed by it.")]
+        public bool alwaysOnTop = true;
         [Tooltip("Panel width in meters; height follows the frame's aspect ratio.")]
         public float panelWidth = 0.55f;
         [Tooltip("Follow smoothing rates (1/s). Higher = more head-locked.")]
@@ -111,19 +119,93 @@ namespace VlaTeleop
             if (_tex != null) Destroy(_tex);
         }
 
+        /// <summary>Build the video quad. With ``alwaysOnTop`` it uses the
+        /// depth-ignoring shader in Resources (built-in RP, ZTest Always +
+        /// Overlay queue) so the point cloud cannot draw over it; otherwise the
+        /// stock Unlit/Texture, which depth-sorts normally.</summary>
         void BuildPanel()
         {
             var go = GameObject.CreatePrimitive(PrimitiveType.Quad);
             go.name = "RobotCameraPanel";
-            Destroy(go.GetComponent<Collider>());
-            _mat = new Material(Shader.Find("Unlit/Texture"));
-            go.GetComponent<MeshRenderer>().sharedMaterial = _mat;
+            DestroyAny(go.GetComponent<Collider>());
+            _mat = new Material(PanelShader());
+            var mr = go.GetComponent<MeshRenderer>();
+            mr.sharedMaterial = _mat;
+            mr.shadowCastingMode = UnityEngine.Rendering.ShadowCastingMode.Off;
+            mr.receiveShadows = false;
             _panel = go.transform;
             _panel.SetParent(transform, false);
             _panel.gameObject.SetActive(false);           // hidden until a frame arrives
             _tex = new Texture2D(2, 2, TextureFormat.RGB24, false);
             _mat.mainTexture = _tex;
         }
+
+        /// <summary>Shader the panel is actually using (diagnostics / tests).</summary>
+        public string PanelShaderName => _mat != null && _mat.shader != null
+            ? _mat.shader.name : "<none>";
+
+        Shader PanelShader()
+        {
+            if (alwaysOnTop)
+            {
+                var s = Resources.Load<Shader>("RobotCameraPanel");
+                if (s != null) return s;
+                Debug.LogWarning("[RobotCamOverlay] Resources/RobotCameraPanel.shader " +
+                                 "missing — falling back to Unlit/Texture, which the " +
+                                 "point cloud can occlude.");
+            }
+            return Shader.Find("Unlit/Texture");
+        }
+
+        static void DestroyAny(UnityEngine.Object o)
+        {
+            if (o == null) return;
+            if (Application.isPlaying) Destroy(o);
+            else DestroyImmediate(o);
+        }
+
+        /// <summary>Editor/headless entry: build the panel without the network
+        /// thread, and show a texture directly. Lets the harness prove the
+        /// panel's placement and occlusion behaviour with no UDP.</summary>
+        public Transform ShowTextureDirect(Texture2D frame)
+        {
+            if (_panel == null) BuildPanel();
+            if (frame == null) return _panel;
+            _mat.mainTexture = frame;
+            _haveSeq = true;
+            _panel.gameObject.SetActive(true);
+            float aspect = frame.height / (float)Mathf.Max(1, frame.width);
+            _panel.localScale = new Vector3(panelWidth, panelWidth * aspect, 1f);
+            return _panel;
+        }
+
+        /// <summary>Rebuild the quad so a changed ``alwaysOnTop`` takes effect
+        /// (the shader is chosen at build time). Editor/headless only — at
+        /// runtime the setting is read once at Start.</summary>
+        public void RebuildPanelForTest()
+        {
+            if (_panel != null) DestroyAny(_panel.gameObject);
+            if (_mat != null) DestroyAny(_mat);
+            _panel = null;
+            _mat = null;
+            BuildPanel();
+        }
+
+        /// <summary>Snap the panel to its target pose immediately (no lazy
+        /// follow) — used on Recenter and by headless tests.</summary>
+        [ContextMenu("Recenter")]
+        public void Recenter()
+        {
+            if (_panel == null || headTransform == null) return;
+            _panel.SetPositionAndRotation(TargetPos(), TargetRot());
+        }
+
+        Vector3 TargetPos() =>
+            headTransform.position + headTransform.forward * distance
+            + Vector3.up * heightOffset;
+
+        Quaternion TargetRot() =>
+            Quaternion.LookRotation(TargetPos() - headTransform.position);
 
         void ReceiveLoop()
         {
@@ -191,12 +273,10 @@ namespace VlaTeleop
         {
             if (_panel == null || headTransform == null || !_panel.gameObject.activeSelf)
                 return;
-            Vector3 fwd = headTransform.forward;
-            Vector3 targetPos = headTransform.position + fwd * distance
-                                + Vector3.up * heightOffset;
             // Quad's visible face is -Z: pointing +Z away from the head shows
             // the texture to the user, un-mirrored.
-            Quaternion targetRot = Quaternion.LookRotation(targetPos - headTransform.position);
+            Vector3 targetPos = TargetPos();
+            Quaternion targetRot = TargetRot();
 
             float dt = Time.deltaTime;
             _panel.position = Vector3.Lerp(

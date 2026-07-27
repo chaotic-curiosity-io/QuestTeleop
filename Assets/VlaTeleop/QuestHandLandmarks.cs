@@ -120,10 +120,21 @@ namespace VlaTeleop
         /// the hand should be reported not-visible. Missing tip bones are
         /// tolerated by falling back to the parent joint so partial skeletons
         /// still yield usable finger angles.
+        ///
+        /// <paramref name="requireHighConfidence"/> defaults to true, which is
+        /// right for the TELEOP STREAM: driving robot joints from low-confidence
+        /// tracking means chasing noise. It is wrong for GESTURE recognition —
+        /// closed-hand poses (fist, thumbs-down) occlude the fingers from the
+        /// cameras, so Quest reports low confidence exactly when you make one,
+        /// and gating here makes those poses impossible to perform while looking
+        /// like the recognizer is broken. Gesture callers pass false and rely on
+        /// their dwell timer to reject noise.
         /// </summary>
-        public static bool TryFill(OVRSkeleton skel, Vector3[] world)
+        public static bool TryFill(OVRSkeleton skel, Vector3[] world,
+                                   bool requireHighConfidence = true)
         {
-            if (skel == null || !skel.IsDataValid || !skel.IsDataHighConfidence
+            if (skel == null || !skel.IsDataValid
+                || (requireHighConfidence && !skel.IsDataHighConfidence)
                 || skel.Bones == null || skel.Bones.Count == 0 || world == null
                 || world.Length < Count)
                 return false;

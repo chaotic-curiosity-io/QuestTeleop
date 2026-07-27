@@ -47,6 +47,9 @@
 using System;
 using System.Collections.Generic;
 using UnityEngine;
+#if ENABLE_INPUT_SYSTEM
+using UnityEngine.InputSystem;
+#endif
 
 namespace VlaTeleop
 {
@@ -67,6 +70,8 @@ namespace VlaTeleop
             PlayToggle,      // play_toggle
             NudgeBack,       // nudge -arg  (step the cursor back)
             NudgeForward,    // nudge +arg
+            Recenter,        // recenter    (re-anchor the overlay + reset the
+                             //              server's torso-yaw zero)
         }
 
         /// <summary>Built-in pose tests, used when no ISDK shape is wired.</summary>
@@ -75,9 +80,40 @@ namespace VlaTeleop
             None, ThumbExtendedFistClosed, OpenPalm, PeaceSign, Fist, PointIndex,
         }
 
-        public enum Orientation { Any, ThumbUp, ThumbDown, PalmForward, FingersUp }
+        /// <summary>Extra world-orientation requirement layered on the finger
+        /// shape. Palm tests are measured against the head's POSITION (the
+        /// direction from the hand to your face), not the gaze direction, so
+        /// they stay correct when you look away from your own hand.</summary>
+        public enum Orientation
+        {
+            Any,
+            ThumbUp,
+            ThumbDown,
+            /// <summary>Thumb held roughly HORIZONTAL — pointing out to either
+            /// side rather than up or down. Distinct from both thumbs-up and
+            /// thumbs-down, and easy to hold steady.</summary>
+            ThumbSideways,
+            FingersUp,
+            /// <summary>Palm turned towards your face (you can see your own
+            /// palm). Deliberate — an open hand hanging naturally faces down or
+            /// away, so this is what separates "pause" from "resting hand".</summary>
+            PalmTowardsFace,
+            /// <summary>Palm turned away from you — a "stop" sign shown to
+            /// someone else.</summary>
+            PalmAway,
+            /// <summary>Palm turned down at the floor.</summary>
+            PalmDown,
+            /// <summary>Both palms turned in at each other (a framing gesture).
+            /// Only meaningful with HandSide.Both; needs both hands tracked and
+            /// reasonably close together, so it is essentially impossible to
+            /// strike by accident.</summary>
+            PalmsFacingEachOther,
+        }
 
-        public enum HandSide { Either, Left, Right }
+        /// <summary>Which hand(s) must hold the pose. ``Both`` means BOTH
+        /// simultaneously — reserved for rare, deliberate actions like
+        /// recalibration, where an accidental trigger is expensive.</summary>
+        public enum HandSide { Either, Left, Right, Both }
 
         [Serializable]
         public class Binding
@@ -88,10 +124,15 @@ namespace VlaTeleop
             public Transport command = Transport.None;
             public HandSide hand = HandSide.Either;
 
-            [Tooltip("Interaction SDK pose recognizer (ShapeRecognizerActiveState / " +
-                     "ActiveStateGroup — anything implementing IActiveState). " +
-                     "Preferred; leave empty to use fallbackShape.")]
+            [Tooltip("Interaction SDK pose recognizer for the LEFT hand " +
+                     "(ShapeRecognizerActiveState / ActiveStateGroup — anything " +
+                     "implementing IActiveState). Preferred; leave empty to use " +
+                     "fallbackShape.")]
             public UnityEngine.Object shapeState;
+            [Tooltip("Recognizer for the RIGHT hand. A recognizer is bound to " +
+                     "ONE hand, so Both/Either bindings need two; falls back to " +
+                     "the left slot when empty.")]
+            public UnityEngine.Object shapeStateRight;
             [Tooltip("Built-in finger test used when shapeState is empty.")]
             public PoseShape fallbackShape = PoseShape.None;
             [Tooltip("Extra world-orientation requirement, checked from the " +
@@ -125,6 +166,28 @@ namespace VlaTeleop
                  "ever sees the command name.")]
         public List<Binding> bindings = new List<Binding>();
 
+        /// <summary>A keyboard shortcut for a transport command. Works in editor
+        /// Play mode (including over Link, using the PC's keyboard) — on a
+        /// standalone headset build there is no keyboard, so the poses remain
+        /// the only control surface there.</summary>
+        [Serializable]
+        public class KeyBinding
+        {
+            public bool enabled = true;
+            [Tooltip("Key NAME, e.g. r, space, f1. Parsed against whichever " +
+                     "input backend the project uses, so it works either way.")]
+            public string key = "r";
+            public Transport command = Transport.None;
+            public float arg = 0f;
+            [NonSerialized] public bool wasDown;
+        }
+
+        [Header("Keyboard shortcuts (editor / Link)")]
+        [Tooltip("Hands-free poses are the real control surface, but a keyboard " +
+                 "is unambiguous — useful while calibrating, and as a way out " +
+                 "when a pose will not register.")]
+        public List<KeyBinding> keyboardShortcuts = DefaultKeys();
+
         [Header("Timeline scrub (rewind)")]
         public bool scrubEnabled = true;
         public HandSide scrubHand = HandSide.Left;
@@ -139,8 +202,17 @@ namespace VlaTeleop
         [Range(0f, 0.9f)] public float pinchOff = 0.4f;
 
         [Header("Debug")]
+        [Tooltip("Require HIGH-confidence tracking for a pose to count. OFF by " +
+                 "default — closed-hand poses (fist, thumbs up) report low " +
+                 "confidence by their nature, and gating on it makes them " +
+                 "silently unfirable. Turn on only if you get false triggers.")]
+        public bool requireHighConfidence = false;
         [Tooltip("Seconds between repeated heartbeat log lines (0 = off).")]
         public float heartbeatSeconds = 5f;
+        [Tooltip("Log every binding's shape/orientation verdict each heartbeat. " +
+                 "This is how you tell 'the shape isn't recognized' from 'the " +
+                 "shape is fine but the orientation check is rejecting it'.")]
+        public bool logBindingDiagnostics = true;
 
         // ---- read-only state for the HUDs ---------------------------------- //
         public string LastCommandName { get; private set; } = "";
@@ -153,6 +225,7 @@ namespace VlaTeleop
         readonly Vector3[] _left21 = new Vector3[QuestHandLandmarks.Count];
         readonly Vector3[] _right21 = new Vector3[QuestHandLandmarks.Count];
         bool _leftOk, _rightOk;
+        bool _leftHighConf, _rightHighConf;
 
         // scrub drag state
         bool _pinching;
@@ -167,6 +240,22 @@ namespace VlaTeleop
         void Reset()
         {
             bindings = DefaultBindings();
+            keyboardShortcuts = DefaultKeys();
+        }
+
+        /// <summary>Stock keyboard mapping. R = recalibrate is the important
+        /// one; the rest make the whole transport drivable without poses while
+        /// you tune them.</summary>
+        public static List<KeyBinding> DefaultKeys()
+        {
+            return new List<KeyBinding>
+            {
+                new KeyBinding { key = "r", command = Transport.Recenter },
+                new KeyBinding { key = "b", command = Transport.RecordStart },
+                new KeyBinding { key = "p", command = Transport.RecordPause },
+                new KeyBinding { key = "s", command = Transport.RecordStop },
+                new KeyBinding { key = "k", command = Transport.PlayToggle },
+            };
         }
 
         /// <summary>The stock mapping. Also used by the setup menu so the
@@ -182,11 +271,16 @@ namespace VlaTeleop
                     fallbackShape = PoseShape.ThumbExtendedFistClosed,
                     orientation = Orientation.ThumbUp, holdSeconds = 0.45f,
                 },
+                // LEFT palm turned in at your own face, held 2.5 s. An open hand
+                // is a RESTING pose, so the orientation plus a long dwell is
+                // what makes this deliberate; the orientation is measured
+                // against your head's POSITION, so looking elsewhere doesn't
+                // change the answer.
                 new Binding
                 {
                     label = "PAUSE", command = Transport.RecordPause,
                     hand = HandSide.Left, fallbackShape = PoseShape.OpenPalm,
-                    orientation = Orientation.PalmForward, holdSeconds = 0.5f,
+                    orientation = Orientation.PalmTowardsFace, holdSeconds = 2.5f,
                 },
                 new Binding
                 {
@@ -200,6 +294,19 @@ namespace VlaTeleop
                     label = "PLAY", command = Transport.PlayToggle,
                     hand = HandSide.Either, fallbackShape = PoseShape.PeaceSign,
                     orientation = Orientation.FingersUp, holdSeconds = 0.5f,
+                },
+                // LEFT thumbs-DOWN, 1.5 s.
+                //
+                // Third pose tried for this: two fists and two framing palms
+                // both failed to fire in practice. Same thumb-out shape as
+                // REC/SAVE, separated only by hand and thumb direction — and
+                // both of those live on the RIGHT hand, so nothing collides.
+                new Binding
+                {
+                    label = "RECENTER", command = Transport.Recenter,
+                    hand = HandSide.Left,
+                    fallbackShape = PoseShape.ThumbExtendedFistClosed,
+                    orientation = Orientation.ThumbDown, holdSeconds = 1.5f,
                 },
             };
         }
@@ -243,16 +350,91 @@ namespace VlaTeleop
             // Hands are re-read here rather than shared with the sender: the
             // sender only fills them at its send rate (30 Hz), and a dwell
             // timer wants every frame.
-            _leftOk = Tracked(leftHand) && QuestHandLandmarks.TryFill(leftSkeleton, _left21);
-            _rightOk = Tracked(rightHand) && QuestHandLandmarks.TryFill(rightSkeleton, _right21);
+            // The confidence gate has to be lifted in BOTH places: TryFill has
+            // its own, and relaxing only the one here changes nothing.
+            _leftOk = Tracked(leftHand)
+                      && QuestHandLandmarks.TryFill(leftSkeleton, _left21,
+                                                    requireHighConfidence);
+            _rightOk = Tracked(rightHand)
+                       && QuestHandLandmarks.TryFill(rightSkeleton, _right21,
+                                                     requireHighConfidence);
+            _leftHighConf = leftHand != null && leftHand.IsDataHighConfidence;
+            _rightHighConf = rightHand != null && rightHand.IsDataHighConfidence;
 
             EvaluateBindings();
+            UpdateKeyboard();
             UpdateScrub();
             Heartbeat();
         }
 
-        static bool Tracked(OVRHand h)
-            => h != null && h.IsTracked && h.IsDataValid && h.IsDataHighConfidence;
+        void UpdateKeyboard()
+        {
+            if (keyboardShortcuts == null) return;
+            foreach (var k in keyboardShortcuts)
+            {
+                if (k == null || !k.enabled || k.command == Transport.None) continue;
+                bool down = KeyHeld(k.key);
+                if (down && !k.wasDown)                       // rising edge
+                {
+                    Debug.Log($"[VlaTeleop] key '{k.key}' -> {k.command}");
+                    FireCommand(k.command, k.arg, k.key.ToUpperInvariant());
+                }
+                k.wasDown = down;
+            }
+        }
+
+        /// <summary>Is this key down right now?
+        ///
+        /// Written against BOTH input backends. This project is set to the new
+        /// Input System only (`activeInputHandler: 1`), where the legacy
+        /// `UnityEngine.Input` throws InvalidOperationException on first use —
+        /// so a legacy-only implementation would not merely fail to work, it
+        /// would spam exceptions from Update.</summary>
+        static bool KeyHeld(string name)
+        {
+            if (string.IsNullOrWhiteSpace(name)) return false;
+#if ENABLE_INPUT_SYSTEM
+            var kb = Keyboard.current;
+            if (kb != null && Enum.TryParse(name, true, out Key key))
+            {
+                var ctrl = kb[key];
+                if (ctrl != null) return ctrl.isPressed;
+            }
+#endif
+#if ENABLE_LEGACY_INPUT_MANAGER
+            if (Enum.TryParse(name, true, out KeyCode code))
+                return Input.GetKey(code);
+#endif
+            return false;
+        }
+
+        /// <summary>Does a key name resolve on the active backend? Editor-side
+        /// validation, so a typo is caught at setup instead of by silence.</summary>
+        public static bool IsKeyNameValid(string name)
+        {
+            if (string.IsNullOrWhiteSpace(name)) return false;
+#if ENABLE_INPUT_SYSTEM
+            if (Enum.TryParse(name, true, out Key _)) return true;
+#endif
+#if ENABLE_LEGACY_INPUT_MANAGER
+            if (Enum.TryParse(name, true, out KeyCode _)) return true;
+#endif
+            return false;
+        }
+
+        /// <summary>Is this hand usable for pose evaluation?
+        ///
+        /// Deliberately does NOT require high confidence by default. Quest
+        /// reports low confidence precisely when fingers occlude each other —
+        /// which is every closed-hand pose — so gating on it makes those poses
+        /// unfirable while looking like the recognizer is broken. The dwell
+        /// timer is the noise filter instead; the teleop STREAM still holds on
+        /// low-confidence frames (that is a separate, correct check in the
+        /// mapper), because a jittery robot arm and a jittery button are not
+        /// the same risk.</summary>
+        bool Tracked(OVRHand h)
+            => h != null && h.IsTracked && h.IsDataValid
+               && (!requireHighConfidence || h.IsDataHighConfidence);
 
         // ---- bindings -------------------------------------------------------- //
 
@@ -289,6 +471,8 @@ namespace VlaTeleop
         {
             if (b.hand == HandSide.Either)
                 return EvaluateSide(b, true) || EvaluateSide(b, false);
+            if (b.hand == HandSide.Both)
+                return EvaluateSide(b, true) && EvaluateSide(b, false);
             return EvaluateSide(b, b.hand == HandSide.Left);
         }
 
@@ -296,8 +480,11 @@ namespace VlaTeleop
         {
             if (!(left ? _leftOk : _rightOk)) return false;
 
-            // Shape: the ISDK recognizer when wired, else the built-in test.
-            var isdk = AsActiveState(b.shapeState);
+            // Shape: the ISDK recognizer for THIS hand when wired, else the
+            // built-in test. Each recognizer watches one hand, so a Both/Either
+            // binding must not reuse one side's recognizer for the other.
+            var isdk = AsActiveState(left ? b.shapeState
+                                          : (b.shapeStateRight ?? b.shapeState));
             if (isdk != null)
             {
                 if (!isdk.Active) return false;
@@ -316,19 +503,31 @@ namespace VlaTeleop
             => o as Oculus.Interaction.IActiveState;
 
         void Fire(Binding b)
+            => FireCommand(b.command, b.arg,
+                           string.IsNullOrEmpty(b.label) ? null : b.label);
+
+        /// <summary>Emit one transport command. Poses and keyboard shortcuts
+        /// both come through here, so they cannot drift apart.</summary>
+        public void FireCommand(Transport command, float arg, string label = null)
         {
-            string wire = WireName(b.command);
+            string wire = WireName(command);
             if (wire == null) return;
-            float arg = b.command == Transport.NudgeBack
-                ? -Mathf.Abs(b.arg <= 0f ? 1f : b.arg)
-                : b.command == Transport.NudgeForward
-                    ? Mathf.Abs(b.arg <= 0f ? 1f : b.arg)
-                    : b.arg;
-            sender.SendCommand(wire, arg);
-            LastCommandName = string.IsNullOrEmpty(b.label) ? wire : b.label;
+            if (command == Transport.NudgeBack)
+                arg = -Mathf.Abs(arg <= 0f ? 1f : arg);
+            else if (command == Transport.NudgeForward)
+                arg = Mathf.Abs(arg <= 0f ? 1f : arg);
+
+            if (sender != null) sender.SendCommand(wire, arg);
+            else Debug.LogWarning("[VlaTeleop] no sender — the server will not " +
+                                  $"hear '{wire}' (local effects still apply).");
+            // Recentering is half local: the server owns the torso-yaw zero, but
+            // the ghost/cloud/video anchors live here. Do the local half now so
+            // it responds instantly and still works with the server down.
+            if (command == Transport.Recenter) RecenterLocal();
+            LastCommandName = label ?? wire;
             LastCommandAt = Time.unscaledTime;
             _beatCommands++;
-            Debug.Log($"[VlaTeleop] gesture '{LastCommandName}' -> {wire}" +
+            Debug.Log($"[VlaTeleop] '{LastCommandName}' -> {wire}" +
                       (Mathf.Abs(arg) > 1e-4f ? $" ({arg:0.##})" : ""));
         }
 
@@ -346,6 +545,7 @@ namespace VlaTeleop
                 case Transport.PlayToggle: return "play_toggle";
                 case Transport.NudgeBack:
                 case Transport.NudgeForward: return "nudge";
+                case Transport.Recenter: return "recenter";
                 default: return null;
             }
         }
@@ -365,17 +565,37 @@ namespace VlaTeleop
         /// <summary>Interior angle at the PIP: a straight finger folds the two
         /// bone vectors back-to-back (dot -> -1), a curled one bends them
         /// towards each other (dot -> 0+). Scale-free, so it needs no
-        /// per-person calibration.</summary>
+        /// per-person calibration.
+        ///
+        /// Returns NaN when the joints are coincident — which is what an
+        /// un-started or dropped skeleton looks like, every landmark at the
+        /// origin. NaN is deliberate: every comparison against it is false, so
+        /// BOTH Extended and Curled fail closed. Returning 0 here (as this once
+        /// did) reads as "curled" and makes every closed-hand pose fire on a
+        /// degenerate hand — which is how Play mode could start recording the
+        /// instant you entered it, before the hands were tracked at all.</summary>
         static float Straightness(Vector3[] w, int i)
         {
             Vector3 a = w[FingerMcp[i]] - w[FingerPip[i]];
             Vector3 b = w[FingerTip[i]] - w[FingerPip[i]];
-            if (a.sqrMagnitude < 1e-8f || b.sqrMagnitude < 1e-8f) return 0f;
+            if (a.sqrMagnitude < 1e-8f || b.sqrMagnitude < 1e-8f) return float.NaN;
             return -Vector3.Dot(a.normalized, b.normalized);      // 1 straight, -1 folded
         }
 
         static bool Extended(Vector3[] w, int i) => Straightness(w, i) > 0.6f;
         static bool Curled(Vector3[] w, int i) => Straightness(w, i) < 0.25f;
+
+        /// <summary>Thumb direction (MCP -> tip), false when degenerate. Unity's
+        /// `.normalized` yields ZERO for a zero vector rather than NaN, and a
+        /// zero dot passes any "is it horizontal" test — so this has to be
+        /// checked explicitly rather than leaned on like Straightness.</summary>
+        static bool ThumbAxis(Vector3[] w, out Vector3 axis)
+        {
+            Vector3 v = w[ThumbTip] - w[ThumbMcp];
+            if (v.sqrMagnitude < 1e-8f) { axis = Vector3.zero; return false; }
+            axis = v.normalized;
+            return true;
+        }
 
         static bool ThumbExtended(Vector3[] w)
         {
@@ -409,6 +629,17 @@ namespace VlaTeleop
             }
         }
 
+        [Header("Orientation thresholds")]
+        [Tooltip("How squarely a palm must face its target. 0.5 ≈ within 60°. " +
+                 "Raise towards 0.8 if a pose fires when you didn't mean it.")]
+        [Range(0.1f, 0.95f)] public float palmDot = 0.6f;
+        [Tooltip("PalmsFacingEachOther: hands must be at least this close (m).")]
+        public float handsTogetherMeters = 0.5f;
+        [Tooltip("ThumbSideways: how close to horizontal the thumb must be. " +
+                 "0.45 ≈ within 27° of level. Raise it if the pose is fiddly to " +
+                 "hold, lower it if it fires while your hand just rests.")]
+        [Range(0.1f, 0.9f)] public float thumbSidewaysDot = 0.45f;
+
         bool OrientationOk(Orientation o, Vector3[] w, bool left)
         {
             switch (o)
@@ -416,19 +647,88 @@ namespace VlaTeleop
                 case Orientation.Any:
                     return true;
                 case Orientation.ThumbUp:
-                    return Vector3.Dot((w[ThumbTip] - w[ThumbMcp]).normalized,
-                                       Vector3.up) > 0.5f;
+                    return ThumbAxis(w, out var tu) && Vector3.Dot(tu, Vector3.up) > 0.5f;
                 case Orientation.ThumbDown:
-                    return Vector3.Dot((w[ThumbTip] - w[ThumbMcp]).normalized,
-                                       Vector3.up) < -0.5f;
+                    return ThumbAxis(w, out var td) && Vector3.Dot(td, Vector3.up) < -0.5f;
+                case Orientation.ThumbSideways:
+                    return ThumbAxis(w, out var ts)
+                           && Mathf.Abs(Vector3.Dot(ts, Vector3.up)) < thumbSidewaysDot;
                 case Orientation.FingersUp:
-                    return Vector3.Dot((w[FingerTip[0]] - w[FingerMcp[0]]).normalized,
-                                       Vector3.up) > 0.5f;
-                case Orientation.PalmForward:
-                    return Vector3.Dot(PalmNormal(w, left), ViewDirection()) > 0.4f;
+                {
+                    Vector3 f = w[FingerTip[0]] - w[FingerMcp[0]];
+                    return f.sqrMagnitude > 1e-8f
+                           && Vector3.Dot(f.normalized, Vector3.up) > 0.5f;
+                }
+
+                // Measured against where your head IS, not where it looks: you
+                // glance around constantly while teleoperating, and a gaze-based
+                // test turns every relaxed open hand into a pause.
+                case Orientation.PalmTowardsFace:
+                {
+                    Vector3 toHead = ToHead(w);
+                    if (toHead == Vector3.zero) return false;     // fail closed
+                    return Vector3.Dot(PalmNormal(w, left), toHead) > palmDot;
+                }
+                case Orientation.PalmAway:
+                {
+                    Vector3 toHead = ToHead(w);
+                    if (toHead == Vector3.zero) return false;
+                    return Vector3.Dot(PalmNormal(w, left), toHead) < -palmDot;
+                }
+                case Orientation.PalmDown:
+                    return Vector3.Dot(PalmNormal(w, left), Vector3.down) > palmDot;
+
+                case Orientation.PalmsFacingEachOther:
+                {
+                    if (!_leftOk || !_rightOk) return false;
+                    Vector3 lw = _left21[Wrist], rw = _right21[Wrist];
+                    Vector3 sep = rw - lw;
+                    if (sep.magnitude > handsTogetherMeters) return false;
+                    Vector3 toOther = (left ? sep : -sep).normalized;
+                    return Vector3.Dot(PalmNormal(w, left), toOther) > palmDot;
+                }
                 default:
                     return true;
             }
+        }
+
+        /// <summary>Unit vector from the hand towards the head. Returns zero if
+        /// there is no head — every palm test then fails closed rather than
+        /// comparing against some fixed world axis, which would make an
+        /// orientation check look like it "doesn't distinguish anything".</summary>
+        Vector3 ToHead(Vector3[] w)
+        {
+            var head = ResolveHead();
+            if (head == null) return Vector3.zero;
+            Vector3 d = head.position - w[Wrist];
+            return d.sqrMagnitude > 1e-6f ? d.normalized : Vector3.zero;
+        }
+
+        bool _warnedNoHead;
+
+        /// <summary>Head transform, resolved lazily.
+        ///
+        /// Start() order between this component and VlaTeleopSender is not
+        /// guaranteed, so binding the head once in Start() can capture the
+        /// sender's still-null field and leave every palm test referenceless for
+        /// the whole session.</summary>
+        Transform ResolveHead()
+        {
+            if (headTransform != null) return headTransform;
+            if (sender != null && sender.headTransform != null)
+                return headTransform = sender.headTransform;
+            var rig = FindObjectOfType<OVRCameraRig>();
+            if (rig != null && rig.centerEyeAnchor != null)
+                return headTransform = rig.centerEyeAnchor;
+            if (Camera.main != null) return headTransform = Camera.main.transform;
+            if (!_warnedNoHead)
+            {
+                _warnedNoHead = true;
+                Debug.LogError("[VlaTeleop] No head transform — palm-orientation " +
+                               "gestures (PAUSE, RECENTER) cannot be evaluated and " +
+                               "will never fire. Assign headTransform explicitly.");
+            }
+            return null;
         }
 
         /// <summary>Outward palm normal. The index->pinky knuckle span crossed
@@ -444,9 +744,6 @@ namespace VlaTeleop
             n.Normalize();
             return left ? -n : n;
         }
-
-        Vector3 ViewDirection()
-            => headTransform != null ? headTransform.forward : Vector3.forward;
 
         // ---- timeline scrub --------------------------------------------------- //
 
@@ -513,17 +810,91 @@ namespace VlaTeleop
         {
             if (heartbeatSeconds <= 0f || Time.unscaledTime < _nextBeat) return;
             _nextBeat = Time.unscaledTime + heartbeatSeconds;
-            Debug.Log($"[VlaTeleop] gestures hb hands L:{(_leftOk ? "✓" : "–")} " +
-                      $"R:{(_rightOk ? "✓" : "–")} fired:{_beatCommands} " +
+            Debug.Log($"[VlaTeleop] gestures hb hands L:{Mark(_leftOk, _leftHighConf)} " +
+                      $"R:{Mark(_rightOk, _rightHighConf)} fired:{_beatCommands} " +
                       $"scrub:{(ScrubActive ? ScrubPos.ToString("0.00") : "–")} " +
                       $"last:{(LastCommandName.Length > 0 ? LastCommandName : "none")}");
             _beatCommands = 0;
+            if (logBindingDiagnostics) LogBindingDiagnostics();
+        }
+
+        static string Mark(bool ok, bool high) => !ok ? "–" : (high ? "✓" : "~");
+
+        /// <summary>Per-binding verdict: does the SHAPE match, and separately,
+        /// does the ORIENTATION allow it? Those two failing look identical from
+        /// inside the headset ("nothing happens") but need opposite fixes.</summary>
+        void LogBindingDiagnostics()
+        {
+            var sb = new System.Text.StringBuilder("[VlaTeleop] poses ");
+            foreach (var b in bindings)
+            {
+                if (b == null || !b.enabled || b.command == Transport.None) continue;
+                sb.Append(b.label).Append(':');
+                sb.Append(Verdict(b, true)).Append('/').Append(Verdict(b, false));
+                sb.Append("  ");
+            }
+            sb.Append("(L/R; . untracked, s shape-only, S shape+orientation)");
+            Debug.Log(sb.ToString());
+        }
+
+        char Verdict(Binding b, bool left)
+        {
+            if (!(left ? _leftOk : _rightOk)) return '.';
+            var w = left ? _left21 : _right21;
+            var isdk = AsActiveState(b.shapeState);
+            bool shape = isdk != null ? isdk.Active : ShapeActive(b.fallbackShape, w);
+            if (!shape) return '-';
+            return OrientationOk(b.orientation, w, left) ? 'S' : 's';
         }
 
         // ---- inspector conveniences ------------------------------------------- //
 
+        /// <summary>Reset BOTH tables to the shipped defaults.
+        ///
+        /// Serialized lists in a saved scene win over the code defaults, so a
+        /// component placed before a binding changed keeps the old one forever.
+        /// Anything that ships new defaults has to reset here or they never
+        /// reach an existing scene.</summary>
         [ContextMenu("Restore Default Bindings")]
-        public void RestoreDefaults() => bindings = DefaultBindings();
+        public void RestoreDefaults()
+        {
+            bindings = DefaultBindings();
+            keyboardShortcuts = DefaultKeys();
+        }
+
+        /// <summary>Re-anchor everything that hangs off the player: the ghost's
+        /// captured root, the point cloud's parked anchor and the video panel.
+        /// The server side of the same command resets its torso-yaw zero.</summary>
+        [ContextMenu("Recenter Now")]
+        public void RecenterLocal()
+        {
+            var driver = FindObjectOfType<RobotOverlayDriver>();
+            if (driver != null)
+            {
+                driver.Recenter();               // also re-parks cloud + panel
+                return;
+            }
+            // No ghost in the scene — still re-park whatever overlays exist.
+            var cloud = FindObjectOfType<RobotPointCloudOverlay>();
+            if (cloud != null) cloud.PlaceAnchorInFront();
+            var cam = FindObjectOfType<RobotCameraOverlay>();
+            if (cam != null) cam.Recenter();
+        }
+
+        /// <summary>Headless entry: run one binding against synthetic hands,
+        /// through the REAL shape + orientation path. Pass null for a hand that
+        /// should read as untracked. Used by VLAPlaybackOverlayHeadlessTest.</summary>
+        public bool EvaluatePoseForTest(Binding b, Vector3[] left21, Vector3[] right21,
+                                        Transform head)
+        {
+            headTransform = head;
+            _warnedNoHead = true;                 // harness drives this deliberately
+            _leftOk = left21 != null;
+            _rightOk = right21 != null;
+            if (_leftOk) Array.Copy(left21, _left21, QuestHandLandmarks.Count);
+            if (_rightOk) Array.Copy(right21, _right21, QuestHandLandmarks.Count);
+            return Evaluate(b);
+        }
 
         [ContextMenu("Test: Start Recording")]
         void TestRecord() => sender?.SendCommand("rec_start", 0f);

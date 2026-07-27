@@ -248,6 +248,29 @@ what the HUD's ● REC / timeline reads.
 | 👎 **thumbs down** (right) | stop + save the episode |
 | ✌️ **peace sign** (either) | step out of the robot and play the take back (again = take control back) |
 | 🤏 **pinch + drag** (left index, hold 0.5 s) | scrub the timeline; release to **splice** |
+| 👎 **left** thumbs-down (hold 1.5 s) | recenter the robot/origin on you (see below) |
+
+### Keyboard shortcuts (editor Play mode / over Link)
+
+Poses are the real control surface, but a keyboard is unambiguous — use it
+while calibrating, and as the way out when a pose will not register:
+
+| key | does |
+|---|---|
+| **R** | **recalibrate / recenter** |
+| B | begin recording |
+| P | pause |
+| S | stop + save |
+| K | play the take back |
+
+Rebindable on the `TeleopGestureCommands` component (`keyboardShortcuts`), by
+key NAME. There is no keyboard on a standalone headset build, so this is an
+editor/Link facility only — the poses still have to work for untethered use.
+
+This project runs the **new Input System only** (`activeInputHandler: 1`),
+where the legacy `UnityEngine.Input` throws on first use. The lookup is written
+against both backends and validated by `IsKeyNameValid`, so a key name that
+does not resolve is caught at setup rather than by silence.
 
 Each pose must be held ~0.5 s before it fires, and released before it can fire
 again — the HUD panel shows a dwell bar while you hold one, so a gesture that
@@ -275,9 +298,70 @@ frame, dropped}]`), so a spliced demo stays auditable.
 **Playback drives the real robot.** Stepping out replays the take through the
 same `TeleopState` the mapper writes, so it reaches Unity over the WebSocket
 chunk stream that is already running: the DevVLA robot moves and the ghost
-moves, with no playback code on either Unity side. The ghost also **detaches**
-— during playback it parks in front of you instead of on you (`RobotOverlayDriver.
-detachDuringPlayback`), which is the whole point of stepping out.
+moves, with no playback code on either Unity side.
+
+**The ghost walks out and performs.** During playback it leaves your body,
+walks to a stand `playbackDistance` (2.2 m) ahead, turns to face you, and acts
+out the recorded joint motion — and **its point cloud comes with it**
+(`RobotOverlayDriver.pointCloud`). That hand-off matters: the cloud normally
+rides its own parked anchor, so without it the cloud would perform the take
+where it happens to be while the ghost walked out empty-handed — the robot and
+the world it perceived performing in two different places. When playback ends
+both come home and the ghost re-plants on you.
+
+### Two lessons about pose design
+
+Both cost a live session, and both generalise to any gesture you add:
+
+1. **An open hand is a resting pose, so finger shape alone cannot be a
+   command.** PAUSE keys on the palm being turned at *your own face*, and that
+   test is measured against your head's **position**, not its forward vector —
+   you glance around constantly while teleoperating, and a gaze-relative test
+   turns every relaxed hand into a pause.
+2. **Closed-hand poses report LOW tracking confidence**, because the fingers
+   occlude each other — that is the tracker working correctly. Gating gesture
+   recognition on `IsDataHighConfidence` therefore makes fists and thumbs-down
+   silently unfirable while looking exactly like a broken recognizer. The dwell
+   timer is the noise filter instead (`requireHighConfidence`, default **off**).
+   The teleop *stream* still holds on low-confidence frames — a jittery robot
+   arm and a jittery button are not the same risk.
+
+   **That gate lives in TWO places** and both must be lifted:
+   `TeleopGestureCommands.Tracked()` *and* `QuestHandLandmarks.TryFill()`, which
+   has its own `!IsDataHighConfidence` early-out. Relaxing only the first one
+   changes nothing at all — the landmarks never get filled, so no closed-hand
+   pose can ever evaluate. `TryFill` still defaults to requiring high confidence
+   (correct for the teleop stream); gesture callers pass `false`.
+3. **Resolve the head transform lazily.** `Start()` order between this component
+   and `VlaTeleopSender` is not guaranteed, so binding it once can capture a
+   still-null field and leave every palm test without a reference for the whole
+   session. Palm tests now **fail closed** when there is no head, rather than
+   falling back to a fixed world axis — a fallback like that fires wherever you
+   happen to stand, which reads as "the orientation check does nothing".
+
+The 5 s heartbeat prints a verdict per binding per hand — `.` untracked,
+`-` no shape, `s` shape but orientation rejected, `S` firing — so "nothing
+happens" tells you *which* half to fix.
+
+### Recalibrating at runtime
+
+If the robot starts out at an odd offset, that is the **Superimposed anchor
+captured once, too early** — before body tracking settled, or before you stood
+where you meant to. Hold a **left-hand thumbs-DOWN** for **1.5 s**.
+
+Same thumb-out shape as REC and SAVE, separated by hand and thumb direction —
+and both of those live on the *right* hand, so nothing collides.
+
+Two earlier poses for this were tried and abandoned in live sessions: two
+fists, then two open palms framing each other. Both were theoretically better
+(a two-handed pose is essentially impossible to trigger by accident) and both
+failed to fire reliably. **For in-VR controls, a pose you can strike every time
+beats a pose that can't misfire.** It re-plants the
+ghost root on your current pose, re-parks the point cloud and the video panel,
+and tells the server to clear its torso-yaw zero so arm anchoring re-references
+from how you are standing *now*. It works mid-take (the seam is logged to the
+episode's `meta.json` rather than silently smoothed over), and the local half
+runs even with the server down.
 
 Setup: **Tools ▸ Robot Teleop ▸ Gestures ▸ Add Gesture Transport**, then
 optionally **Build Gesture Poses (ISDK)** — see the next section. Nothing needs
@@ -301,10 +385,37 @@ earlier and add a dwell timer plus a world-orientation test. Reading it
 ourselves is what lets one shape mean two things: **thumbs up and thumbs down
 are the same `ShapeRecognizer`** — only the thumb's world direction differs.
 
-**Tools ▸ Robot Teleop ▸ Gestures ▸ Build Gesture Poses (ISDK)** builds that
-hierarchy under a `TeleopGesturePoses` object and assigns each recognizer to
-its binding (adding a `FingerFeatureStateProvider` with the SDK's own default
-thresholds if the rig lacks one). **Remove Gesture Poses** tears it back down.
+### One-click setup (do this)
+
+**Tools ▸ Robot Teleop ▸ Gestures ▸ Set Up ISDK Hand Poses in H1-Quest** opens
+that scene, does everything below, and saves it. (**… (Active Scene)** does the
+same to whatever scene is open.) Safe to re-run — it is idempotent.
+
+It installs the **`OVRComprehensiveInteractionRig`** prefab under your
+`OVRCameraRig` — the same rig `PoseExamples.unity` uses. The Quick Actions
+wizard that normally adds it is an `internal` class we cannot call, so the tool
+instantiates the prefab by GUID and does the wizard's follow-up work itself:
+wiring `OVRCameraRigRef._ovrCameraRig` (the component asserts on it at Start,
+so an unwired rig throws the moment you press Play) and disabling the Core
+block's duplicate hand visuals, which would otherwise give you two offset sets
+of hands.
+
+Then it adds the gesture transport, resolves a `FingerFeatureStateProvider` per
+hand, builds one `ShapeRecognizerActiveState` per (binding, hand) under a
+`TeleopGesturePoses` object, and assigns them. **Remove Gesture Poses** tears
+the recognizer half back down.
+
+Two things worth knowing about that wiring:
+
+* **The rig contains ~18 `Hand` components**, including *synthetic* ones that
+  replay a pose rather than reporting your live finger curls. Pose detection
+  hung off one of those would simply never fire. The tool therefore prefers the
+  providers the rig already ships (bound to the tracked hands) and only creates
+  its own if none exist.
+* **A recognizer watches ONE hand**, so `Both` / `Either` bindings need two.
+  Bindings have `shapeState` (left) and `shapeStateRight` — reusing one
+  recognizer for both sides would quietly turn "both hands" into "whichever
+  hand that recognizer happens to watch".
 
 > **Two things are both called "hand tracking".** These scenes use the
 > Building Blocks **Hand Tracking** block — category *Core* — which adds
