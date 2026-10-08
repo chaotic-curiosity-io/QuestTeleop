@@ -10,8 +10,8 @@ a robot, and you see the result in passthrough.
 
 | Bridge | Drives | Talks to |
 |---|---|---|
-| **`Assets/VlaTeleop/`** | robot **joints** — finger curls, arm IK, head — for humanoids (Unitree H1 / G1, Fourier GR-1, …) | [openvla-unity-sim2real](https://github.com/chaotic-curiosity-io/robotics-unity) `handtracking/teleop_server.py` → DevVLA |
-| **`Assets/ReachyBridge/`** | a **Reachy Mini** in follow-user / follow-hand / raycast / gaze modes | the ReachyBrain XR bridge (Mac server + on-robot app) |
+| **`Assets/VlaTeleop/`** | robot **joints** — finger curls, arm IK, head — for humanoids (Unitree H1 / G1, Fourier GR-1, …) | openvla-unity-sim2real (private; see the [companion book](https://chaotic-curiosity-io.github.io/robotics-unity-book/)) `handtracking/teleop_server.py` → DevVLA |
+| **`Assets/ReachyBridge/`** | a **Reachy Mini** in follow-user / follow-hand / raycast / gaze modes | the ReachyBrain XR bridge (Mac server + on-robot app; private) |
 
 Each subfolder has its own README with the full setup; this one is the map.
 
@@ -30,8 +30,8 @@ Quest gives everything the sensor side of teleop wants, natively and metric:
 ## Requirements
 
 - **Quest 3 / 3S** (older Quest hardware doesn't expose passthrough camera frames).
-- **Unity 6000.3.19f1** (this project's version; `ProjectSettings/ProjectVersion.txt`).
-- **MRUK v85** (`com.meta.xr.mrutilitykit` 85.0.0) for `PassthroughCameraAccess`;
+- **Unity 6000.3.6f1** (this project's version; `ProjectSettings/ProjectVersion.txt`).
+- **MRUK v205** (`com.meta.xr.mrutilitykit` 205.0.0) for `PassthroughCameraAccess`;
   Meta Core SDK for `OVRCameraRig` / `OVRHand` / `OVRSkeleton` / `OVRInput`.
 - **Horizon OS v74+**, hand tracking enabled, and the
   `horizonos.permission.HEADSET_CAMERA` permission + passthrough
@@ -51,7 +51,7 @@ Quest gives everything the sensor side of teleop wants, natively and metric:
    and `192.168.1.152:9906` (DevVLA head camera). Headset + host on the same Wi-Fi.
 4. Build + run on the Quest (**ReachyBridge ▸ Build and Run on Quest** builds any
    scene in this project).
-5. On the host, in [openvla-unity-sim2real](https://github.com/chaotic-curiosity-io/robotics-unity):
+5. On the host, in openvla-unity-sim2real (private repository; available on request):
    ```bash
    handtracking/run_xr_teleop.sh --robot h1 --xr-host 0.0.0.0
    ```
@@ -87,9 +87,9 @@ build on.
 
 ## Related projects
 
-- **[openvla-unity-sim2real](https://github.com/chaotic-curiosity-io/robotics-unity)** —
+- **openvla-unity-sim2real** (private; written up in the [companion book](https://chaotic-curiosity-io.github.io/robotics-unity-book/)) —
   the host-side teleop server + DevVLA robot scenes the VlaTeleop bridge drives.
-- **VitureUnity** — the Viture Luma Ultra sibling app; QuestTeleop's VlaTeleop is
+- **VitureUnity** (private) — the Viture Luma Ultra sibling app; QuestTeleop's VlaTeleop is
   a port of its `VlaTeleopSender` ("Pipeline 3 — XR teleop") with native Quest
   hands in place of MediaPipe.
 
